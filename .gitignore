@@ -1,0 +1,22 @@
+# Build outputs
+main.exe
+main.obj
+
+# Benchmark output
+*.log
+*.err
+*.bmp
+*.json
+*.csv
+bench-err.txt
+bench-out.txt
+diagnostics.txt
+legacy-10000.txt
+legacy.txt
+shader-10000.txt
+shader-err.txt
+shader-out.txt
+
+# Local comparison and backup copies
+github-main.cpp
+main-current-working.cpp

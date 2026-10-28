@@ -231,11 +231,14 @@ struct CircleThroughputMetrics
     UINT64 circlesDrawnIntoCanvas = 0;
     UINT64 displayFrames = 0;
     UINT64 canvasUpdates = 0;
+    double measurementElapsedMilliseconds = 0.0;
     double sceneDataPreparationMilliseconds = 0.0;
     double sceneAdditionElapsedMilliseconds = 0.0;
     double canvasCompletionElapsedMilliseconds = 0.0;
     double canvasDrawCommandIssueMilliseconds = 0.0;
     double canvasUpdateEndDrawMilliseconds = 0.0;
+    double canvasDrawCommandIssueCpuMilliseconds = 0.0;
+    double canvasUpdateEndDrawCpuMilliseconds = 0.0;
     double canvasUpdateElapsedMilliseconds = 0.0;
     double rendererGeometryPreparationMilliseconds = 0.0;
     double rendererGeometryUploadMilliseconds = 0.0;
@@ -249,6 +252,11 @@ struct CircleThroughputMetrics
     double d3dFinalFenceDrainMilliseconds = 0.0;
     double circlesAddedPerSecond = 0.0;
     double circlesDrawnIntoCanvasPerSecond = 0.0;
+    double endToEndElapsedMilliseconds = 0.0;
+    double circlesAddedEndToEndPerSecond = 0.0;
+    double circlesDrawnEndToEndPerSecond = 0.0;
+    UINT64 canvasDrawCommandIssueCycles = 0;
+    UINT64 canvasUpdateEndDrawCycles = 0;
     bool gpuDrawTimeAvailable = false;
     const char* canvasCompletionSemantics = "unknown";
 };
@@ -317,7 +325,7 @@ std::uint64_t HashCircleScene(const std::vector<CircleParameters>& circles)
 struct CommandLineOptions
 {
     UINT circleCount = 0;
-    UINT circleBatchSize = kZeroIntervalBatchSize;
+    UINT circleBatchSize = kMaximumAdaptiveBatchSize;
     bool circlesSpecified = false;
     bool benchmark = false;
     bool renderBenchmark = false;
@@ -847,7 +855,9 @@ public:
     {
         if (drawIntervalMs_ == 0)
         {
-            return kZeroIntervalBatchSize;
+            return rendererMode_ == RendererMode::Direct2D
+                ? kMaximumAdaptiveBatchSize
+                : kZeroIntervalBatchSize;
         }
         if (!batchingEnabled_)
         {
@@ -1376,18 +1386,16 @@ public:
                 throw std::runtime_error(
                     "QueryPerformanceCounter failed after scene preparation");
             }
-            direct2DScenePreparationTicks_ = static_cast<UINT64>(
+            const UINT64 preparationTicks = static_cast<UINT64>(
                 scenePreparationStop.QuadPart - scenePreparationStart.QuadPart);
+            if (rendererMode_ == RendererMode::Direct2D)
+            {
+                direct2DScenePreparationTicks_ = preparationTicks;
+            }
             if (circleThroughputBenchmarkEnabled_)
             {
-                circleThroughputScenePreparationTicks_ =
-                    direct2DScenePreparationTicks_;
+                circleThroughputScenePreparationTicks_ = preparationTicks;
             }
-        }
-        else if (circleThroughputBenchmarkEnabled_)
-        {
-            circleThroughputScenePreparationTicks_ = static_cast<UINT64>(
-                scenePreparationStop.QuadPart - scenePreparationStart.QuadPart);
         }
         if (rendererMode_ == RendererMode::Direct2D)
         {
@@ -1504,7 +1512,11 @@ public:
         }
 
         LARGE_INTEGER frameStart{};
-        if (diagnosticsEnabled_ && !QueryPerformanceCounter(&frameStart))
+        LARGE_INTEGER throughputWaitStart{};
+        if ((diagnosticsEnabled_ &&
+             !QueryPerformanceCounter(&frameStart)) ||
+            (circleThroughputBenchmarkActive_ &&
+             !QueryPerformanceCounter(&throughputWaitStart)))
         {
             throw std::runtime_error(
                 "QueryPerformanceCounter failed before frame wait");
@@ -1512,6 +1524,20 @@ public:
 
         const UINT frameIndex = swapChain_->GetCurrentBackBufferIndex();
         WaitForFrame(frameIndex);
+        LARGE_INTEGER throughputWaitStop{};
+        if (circleThroughputBenchmarkActive_)
+        {
+            if (!QueryPerformanceCounter(&throughputWaitStop))
+            {
+                throw std::runtime_error(
+                    "QueryPerformanceCounter failed after D3D12 frame wait");
+            }
+            AddCircleThroughputElapsed(
+                circleThroughputMetrics_.d3dFrameFenceWaitMilliseconds,
+                static_cast<UINT64>(
+                    throughputWaitStop.QuadPart -
+                    throughputWaitStart.QuadPart));
+        }
         LARGE_INTEGER waitEnd{};
         if (diagnosticsEnabled_ && !QueryPerformanceCounter(&waitEnd))
         {
@@ -1545,7 +1571,9 @@ public:
         LARGE_INTEGER presentReturn{};
         ULONGLONG benchmarkPresentCycleStart = 0;
         ULONGLONG benchmarkPresentCycleStop = 0;
-        if (rendererBenchmarkActive_ &&
+        const bool measurePresent =
+            rendererBenchmarkActive_ || circleThroughputBenchmarkActive_;
+        if (measurePresent &&
             (!QueryPerformanceCounter(&benchmarkPresentStart) ||
              !QueryThreadCycleTime(
                  GetCurrentThread(), &benchmarkPresentCycleStart)))
@@ -1557,7 +1585,7 @@ public:
         ThrowIfFailed(
             swapChain_->Present(0, presentFlags),
             "IDXGISwapChain::Present");
-        if (rendererBenchmarkActive_)
+        if (measurePresent)
         {
             if (!QueryThreadCycleTime(
                     GetCurrentThread(), &benchmarkPresentCycleStop) ||
@@ -1565,6 +1593,9 @@ public:
             {
                 throw std::runtime_error("Could not stop Present timing");
             }
+        }
+        if (rendererBenchmarkActive_)
+        {
             if (presentReturn.QuadPart < rendererBenchmarkMeasurementEnd_.QuadPart)
             {
                 ++rendererBenchmarkPresentReturns_;
@@ -1579,6 +1610,20 @@ public:
                 sample.renderedCircles = lastFrameRenderedCircleCount_;
                 rendererBenchmarkFrameSamples_.push_back(sample);
             }
+        }
+        if (circleThroughputBenchmarkActive_)
+        {
+            ++circleThroughputMetrics_.displayFrames;
+            if (lastFrameRenderedCircleCount_ != 0)
+            {
+                ++circleThroughputMetrics_.canvasUpdates;
+                circleThroughputMetrics_.circlesDrawnIntoCanvas +=
+                    lastFrameRenderedCircleCount_;
+            }
+            AddCircleThroughputElapsed(
+                circleThroughputMetrics_.d3dPresentApiMilliseconds,
+                static_cast<UINT64>(
+                    presentReturn.QuadPart - benchmarkPresentStart.QuadPart));
         }
         if (pipelineComparisonActive_ &&
             timerComparisonPhase_ == TimerComparisonPhase::Measuring)
@@ -1669,6 +1714,10 @@ public:
                           : static_cast<double>(diagnosticSignalTicks_) *
                                 ticksToMs / frameCount)
                   << '\n' << std::flush;
+        if (rendererMode_ == RendererMode::Legacy)
+        {
+            PrintLegacyMemoryDiagnostics();
+        }
 
         diagnosticWindowStartMs_ = now;
         diagnosticFrameCount_ = 0;
@@ -1789,6 +1838,232 @@ public:
     void RunGpuBenchmark()
     {
         RunRendererBenchmark(10000, true);
+    }
+
+    void RunCircleThroughputBenchmark()
+    {
+        if (!circleThroughputBenchmarkEnabled_ ||
+            circleThroughputTargetCount_ == 0 ||
+            circleThroughputShapes_.size() != circleThroughputTargetCount_ ||
+            !drawingShapes_.empty())
+        {
+            throw std::runtime_error(
+                "Circle-throughput benchmark was not initialized with an empty canvas and complete scene");
+        }
+        if (!QueryPerformanceFrequency(&circleThroughputQpcFrequency_) ||
+            circleThroughputQpcFrequency_.QuadPart <= 0)
+        {
+            throw std::runtime_error(
+                "QueryPerformanceFrequency failed for circle-throughput benchmark");
+        }
+
+        circleThroughputMetrics_ = {};
+        circleThroughputMetrics_.batchSize = circleThroughputBatchSize_;
+        circleThroughputMetrics_.sceneDataPreparationMilliseconds =
+            static_cast<double>(circleThroughputScenePreparationTicks_) *
+            1000.0 /
+            static_cast<double>(circleThroughputQpcFrequency_.QuadPart);
+        gpuTimestampTicksTotal_ = 0;
+        gpuTimestampFrameCount_ = 0;
+
+        LARGE_INTEGER measurementStart{};
+        FILETIME cpuStartCreation{}, cpuStartExit{}, cpuStartKernel{}, cpuStartUser{};
+        ULONGLONG allCyclesStart = 0;
+        if (!QueryPerformanceCounter(&measurementStart) ||
+            !GetThreadTimes(
+                GetCurrentThread(), &cpuStartCreation, &cpuStartExit,
+                &cpuStartKernel, &cpuStartUser) ||
+            !QueryThreadCycleTime(GetCurrentThread(), &allCyclesStart))
+        {
+            throw std::runtime_error(
+                "Could not start circle-throughput measurement counters");
+        }
+        circleThroughputBenchmarkActive_ = true;
+        std::size_t nextShape = 0;
+        while (nextShape < circleThroughputShapes_.size())
+        {
+            const UINT batchCount = static_cast<UINT>(std::min<std::size_t>(
+                circleThroughputBatchSize_,
+                circleThroughputShapes_.size() - nextShape));
+            const std::size_t firstShapeIndex = drawingShapes_.size();
+            LARGE_INTEGER additionStart{};
+            LARGE_INTEGER additionStop{};
+            if (!QueryPerformanceCounter(&additionStart))
+            {
+                throw std::runtime_error(
+                    "QueryPerformanceCounter failed before scene insertion");
+            }
+            drawingShapes_.insert(
+                drawingShapes_.end(),
+                circleThroughputShapes_.begin() +
+                    static_cast<std::ptrdiff_t>(nextShape),
+                circleThroughputShapes_.begin() +
+                    static_cast<std::ptrdiff_t>(nextShape + batchCount));
+            if (!QueryPerformanceCounter(&additionStop))
+            {
+                throw std::runtime_error(
+                    "QueryPerformanceCounter failed after scene insertion");
+            }
+            AddCircleThroughputElapsed(
+                circleThroughputMetrics_.sceneAdditionElapsedMilliseconds,
+                static_cast<UINT64>(
+                    additionStop.QuadPart - additionStart.QuadPart));
+            OnInteractiveShapesAdded(firstShapeIndex, batchCount);
+            circleThroughputMetrics_.circlesAddedToScene += batchCount;
+            Render();
+            nextShape += batchCount;
+        }
+
+        if (rendererMode_ != RendererMode::Direct2D)
+        {
+            LARGE_INTEGER drainStart{};
+            LARGE_INTEGER drainStop{};
+            if (!QueryPerformanceCounter(&drainStart))
+            {
+                throw std::runtime_error(
+                    "QueryPerformanceCounter failed before final D3D12 fence drain");
+            }
+            WaitForGpu();
+            if (!QueryPerformanceCounter(&drainStop))
+            {
+                throw std::runtime_error(
+                    "QueryPerformanceCounter failed after final D3D12 fence drain");
+            }
+            AddCircleThroughputElapsed(
+                circleThroughputMetrics_.d3dFinalFenceDrainMilliseconds,
+                static_cast<UINT64>(
+                    drainStop.QuadPart - drainStart.QuadPart));
+            if (canvasRenderedShapeCount_ != circleThroughputTargetCount_ ||
+                circleThroughputMetrics_.circlesDrawnIntoCanvas !=
+                    circleThroughputTargetCount_)
+            {
+                circleThroughputBenchmarkActive_ = false;
+                throw std::runtime_error(
+                    "D3D12 fence completed without drawing every throughput circle into the persistent canvas");
+            }
+            circleThroughputMetrics_.gpuDrawTimeAvailable =
+                gpuTimestampEnabled_ && gpuTimestampFrequency_ != 0 &&
+                gpuTimestampFrameCount_ ==
+                    circleThroughputMetrics_.canvasUpdates;
+            if (circleThroughputMetrics_.gpuDrawTimeAvailable)
+            {
+                circleThroughputMetrics_.d3dGpuDrawMilliseconds =
+                    static_cast<double>(gpuTimestampTicksTotal_) * 1000.0 /
+                    static_cast<double>(gpuTimestampFrequency_);
+            }
+        }
+        else
+        {
+            if (circleThroughputMetrics_.circlesDrawnIntoCanvas <
+                circleThroughputTargetCount_)
+            {
+                circleThroughputBenchmarkActive_ = false;
+                throw std::runtime_error(
+                    "Direct2D did not successfully draw every throughput circle into the persistent canvas");
+            }
+            circleThroughputMetrics_.circlesDrawnIntoCanvas =
+                circleThroughputTargetCount_;
+        }
+        FILETIME cpuStopCreation{}, cpuStopExit{}, cpuStopKernel{}, cpuStopUser{};
+        ULONGLONG allCyclesStop = 0;
+        if (!GetThreadTimes(
+                GetCurrentThread(), &cpuStopCreation, &cpuStopExit,
+                &cpuStopKernel, &cpuStopUser) ||
+            !QueryThreadCycleTime(GetCurrentThread(), &allCyclesStop))
+        {
+            circleThroughputBenchmarkActive_ = false;
+            throw std::runtime_error(
+                "Could not stop circle-throughput CPU counters");
+        }
+        circleThroughputBenchmarkActive_ = false;
+
+        LARGE_INTEGER measurementStop{};
+        if (!QueryPerformanceCounter(&measurementStop) ||
+            measurementStop.QuadPart <= measurementStart.QuadPart)
+        {
+            throw std::runtime_error(
+                "Could not determine circle-throughput measurement duration");
+        }
+        circleThroughputMetrics_.measurementElapsedMilliseconds =
+            static_cast<double>(
+                measurementStop.QuadPart - measurementStart.QuadPart) *
+            1000.0 /
+            static_cast<double>(circleThroughputQpcFrequency_.QuadPart);
+        const UINT64 threadCpu100ns =
+            FileTimeValue(cpuStopKernel) + FileTimeValue(cpuStopUser) -
+            FileTimeValue(cpuStartKernel) - FileTimeValue(cpuStartUser);
+        const ULONGLONG threadCycles = allCyclesStop - allCyclesStart;
+        const double cpuMillisecondsPerCycle = threadCycles == 0
+            ? 0.0
+            : (static_cast<double>(threadCpu100ns) / 10000.0) /
+                static_cast<double>(threadCycles);
+        circleThroughputMetrics_.canvasDrawCommandIssueCpuMilliseconds =
+            static_cast<double>(
+                circleThroughputMetrics_.canvasDrawCommandIssueCycles) *
+            cpuMillisecondsPerCycle;
+        circleThroughputMetrics_.canvasUpdateEndDrawCpuMilliseconds =
+            static_cast<double>(
+                circleThroughputMetrics_.canvasUpdateEndDrawCycles) *
+            cpuMillisecondsPerCycle;
+        if (circleThroughputMetrics_.measurementElapsedMilliseconds <= 0.0 ||
+            circleThroughputMetrics_.displayFrames == 0)
+        {
+            throw std::runtime_error(
+                "Circle-throughput benchmark completed without a measurable displayed frame");
+        }
+        circleThroughputMetrics_.circlesAddedPerSecond =
+            static_cast<double>(
+                circleThroughputMetrics_.circlesAddedToScene) * 1000.0 /
+            circleThroughputMetrics_.measurementElapsedMilliseconds;
+        circleThroughputMetrics_.circlesDrawnIntoCanvasPerSecond =
+            static_cast<double>(
+                circleThroughputMetrics_.circlesDrawnIntoCanvas) * 1000.0 /
+            circleThroughputMetrics_.measurementElapsedMilliseconds;
+        circleThroughputMetrics_.canvasCompletionElapsedMilliseconds =
+            circleThroughputMetrics_.measurementElapsedMilliseconds;
+        circleThroughputMetrics_.endToEndElapsedMilliseconds =
+            circleThroughputMetrics_.measurementElapsedMilliseconds +
+            circleThroughputMetrics_.sceneDataPreparationMilliseconds;
+        circleThroughputMetrics_.circlesAddedEndToEndPerSecond =
+            static_cast<double>(
+                circleThroughputMetrics_.circlesAddedToScene) * 1000.0 /
+            circleThroughputMetrics_.endToEndElapsedMilliseconds;
+        circleThroughputMetrics_.circlesDrawnEndToEndPerSecond =
+            static_cast<double>(
+                circleThroughputMetrics_.circlesDrawnIntoCanvas) * 1000.0 /
+            circleThroughputMetrics_.endToEndElapsedMilliseconds;
+
+        std::cout << std::fixed << std::setprecision(3)
+                  << "[circle-throughput] status=success renderer="
+                  << RendererModeName(rendererMode_)
+                  << " seed=" << kSeed << " scene_hash=0x"
+                  << std::hex << std::uppercase
+                  << circleThroughputSceneHash_ << std::dec << std::nouppercase
+                  << " circles_added=" << circleThroughputMetrics_.circlesAddedToScene
+                  << " circles_drawn_into_canvas="
+                  << circleThroughputMetrics_.circlesDrawnIntoCanvas
+                  << " batch_size=" << circleThroughputMetrics_.batchSize
+                  << " displayed_frames=" << circleThroughputMetrics_.displayFrames
+                  << " canvas_updates=" << circleThroughputMetrics_.canvasUpdates
+                  << " elapsed_ms="
+                  << circleThroughputMetrics_.measurementElapsedMilliseconds
+                  << " added_per_second="
+                  << circleThroughputMetrics_.circlesAddedPerSecond
+                  << " drawn_into_canvas_per_second="
+                  << circleThroughputMetrics_.circlesDrawnIntoCanvasPerSecond
+                  << " end_to_end_added_per_second="
+                  << circleThroughputMetrics_.circlesAddedEndToEndPerSecond
+                  << " gpu_draw_ms=";
+        if (circleThroughputMetrics_.gpuDrawTimeAvailable)
+        {
+            std::cout << circleThroughputMetrics_.d3dGpuDrawMilliseconds;
+        }
+        else
+        {
+            std::cout << "unavailable";
+        }
+        std::cout << '\n';
+        StoreCircleThroughputBenchmarkJson();
     }
 
     void RunRendererBenchmark(UINT measurementMilliseconds, bool gpuBenchmark)
@@ -2461,6 +2736,203 @@ public:
     }
 
 private:
+    void StoreCircleThroughputBenchmarkJson()
+    {
+        if (benchmarkOutputFile_.empty())
+        {
+            return;
+        }
+        const bool direct2D = rendererMode_ == RendererMode::Direct2D;
+        const CircleThroughputMetrics& metrics = circleThroughputMetrics_;
+        const auto validateMetric = [](double value, const char* name) {
+            if (!std::isfinite(value))
+            {
+                throw std::runtime_error(
+                    std::string("Non-finite circle-throughput metric: ") + name);
+            }
+        };
+        validateMetric(
+            metrics.measurementElapsedMilliseconds,
+            "measurement_elapsed_ms");
+        validateMetric(
+            metrics.circlesAddedPerSecond,
+            "circles_added_per_second");
+        validateMetric(
+            metrics.circlesDrawnIntoCanvasPerSecond,
+            "circles_drawn_into_canvas_per_second");
+        validateMetric(
+            metrics.endToEndElapsedMilliseconds,
+            "end_to_end_including_preparation_elapsed_ms");
+        validateMetric(
+            metrics.circlesAddedEndToEndPerSecond,
+            "circles_added_end_to_end_per_second");
+        validateMetric(
+            metrics.circlesDrawnEndToEndPerSecond,
+            "circles_drawn_end_to_end_per_second");
+        validateMetric(
+            metrics.canvasDrawCommandIssueCpuMilliseconds,
+            "canvas_draw_command_issue_cpu_est_ms");
+        validateMetric(
+            metrics.canvasUpdateEndDrawCpuMilliseconds,
+            "canvas_update_enddraw_cpu_est_ms");
+
+        std::ostringstream json;
+        const auto writeOptionalMetric = [&json](
+                                             bool available,
+                                             double value) {
+            if (available)
+            {
+                json << value;
+            }
+            else
+            {
+                json << "null";
+            }
+        };
+        json << std::setprecision(10)
+             << "{\n"
+             << "  \"schema_version\": 1,\n"
+             << "  \"benchmark\": \"circle_throughput\",\n"
+             << "  \"status\": \"success\",\n"
+             << "  \"exit_code\": 0,\n"
+             << "  \"renderer\": \"" << RendererModeName(rendererMode_) << "\",\n"
+             << "  \"target_type\": \""
+             << (direct2D ? "ID2D1HwndRenderTarget" : "D3D12_persistent_canvas")
+             << "\",\n"
+             << "  \"hardware_acceleration\": \""
+             << (direct2D ? "unknown" : "yes") << "\",\n"
+             << "  \"circle_count\": " << circleThroughputTargetCount_ << ",\n"
+             << "  \"seed\": " << kSeed << ",\n"
+             << "  \"scene_hash\": \"0x" << std::hex << std::uppercase
+             << circleThroughputSceneHash_ << std::dec << std::nouppercase
+             << "\",\n"
+             << "  \"batch_size\": " << metrics.batchSize << ",\n"
+             << "  \"measurement_elapsed_ms\": "
+             << metrics.measurementElapsedMilliseconds << ",\n"
+             << "  \"completed_frames\": " << metrics.displayFrames << ",\n"
+             << "  \"canvas_update_count\": " << metrics.canvasUpdates << ",\n"
+             << "  \"circles_added_to_scene\": "
+             << metrics.circlesAddedToScene << ",\n"
+             << "  \"circles_drawn_into_canvas\": "
+             << metrics.circlesDrawnIntoCanvas << ",\n"
+             << "  \"circles_added_per_second\": "
+             << metrics.circlesAddedPerSecond << ",\n"
+             << "  \"circles_drawn_into_canvas_per_second\": "
+             << metrics.circlesDrawnIntoCanvasPerSecond << ",\n"
+             << "  \"scene_data_preparation_included_in_throughput_elapsed\": false,\n"
+             << "  \"end_to_end_including_preparation_elapsed_ms\": "
+             << metrics.endToEndElapsedMilliseconds << ",\n"
+             << "  \"circles_added_end_to_end_per_second\": "
+             << metrics.circlesAddedEndToEndPerSecond << ",\n"
+             << "  \"circles_drawn_end_to_end_per_second\": "
+             << metrics.circlesDrawnEndToEndPerSecond << ",\n"
+             << "  \"scene_data_preparation_ms\": "
+             << metrics.sceneDataPreparationMilliseconds << ",\n"
+             << "  \"measurement_scope\": \""
+             << (direct2D
+                     ? "batch insertion through successful Direct2D EndDraw and display; asynchronous GPU completion is unknown; scene preparation and renderer initialization excluded"
+                     : "batch insertion through completed display and final D3D12 fence drain; scene preparation and renderer initialization excluded")
+             << "\",\n"
+             << "  \"end_to_end_scope\": \"scene data preparation plus measurement scope; renderer initialization excluded\",\n"
+             << "  \"scene_addition_elapsed_ms\": "
+             << metrics.sceneAdditionElapsedMilliseconds << ",\n"
+             << "  \"canvas_completion_elapsed_ms\": "
+             << metrics.canvasCompletionElapsedMilliseconds << ",\n"
+             << "  \"canvas_completion_semantics\": \""
+             << (direct2D
+                     ? "successful Direct2D bitmap EndDraw; asynchronous GPU completion is unknown"
+                     : "D3D12 submission confirmed complete by fence")
+             << "\",\n"
+             << "  \"canvas_update_elapsed_ms\": ";
+        if (direct2D)
+        {
+            json << metrics.canvasUpdateElapsedMilliseconds;
+        }
+        else
+        {
+            json << "null";
+        }
+        json << ",\n"
+             << "  \"canvas_draw_command_issue_elapsed_ms\": ";
+        writeOptionalMetric(
+            direct2D, metrics.canvasDrawCommandIssueMilliseconds);
+        json << ",\n"
+             << "  \"canvas_draw_command_issue_cpu_est_ms\": ";
+        writeOptionalMetric(
+            direct2D,
+            metrics.canvasDrawCommandIssueCpuMilliseconds);
+        json << ",\n"
+             << "  \"canvas_update_enddraw_elapsed_ms\": ";
+        writeOptionalMetric(
+            direct2D, metrics.canvasUpdateEndDrawMilliseconds);
+        json << ",\n"
+             << "  \"canvas_update_enddraw_cpu_est_ms\": ";
+        writeOptionalMetric(
+            direct2D,
+            metrics.canvasUpdateEndDrawCpuMilliseconds);
+        json << ",\n"
+             << "  \"cpu_time_estimation\": \""
+             << (direct2D
+                     ? "Direct2D CPU estimates calibrate QueryThreadCycleTime against thread CPU time over the full measurement; they are not GPU time"
+                     : "D3D12 stage timings are QPC elapsed times; GPU draw timing is reported separately")
+             << "\",\n"
+             << "  \"renderer_geometry_preparation_elapsed_ms\": ";
+        writeOptionalMetric(
+            !direct2D, metrics.rendererGeometryPreparationMilliseconds);
+        json << ",\n"
+             << "  \"renderer_geometry_upload_elapsed_ms\": ";
+        writeOptionalMetric(
+            !direct2D, metrics.rendererGeometryUploadMilliseconds);
+        json << ",\n"
+             << "  \"renderer_command_record_elapsed_ms\": ";
+        writeOptionalMetric(
+            !direct2D, metrics.rendererCommandRecordMilliseconds);
+        json << ",\n"
+             << "  \"renderer_command_execute_api_elapsed_ms\": ";
+        writeOptionalMetric(
+            !direct2D, metrics.rendererCommandExecuteMilliseconds);
+        json << ",\n"
+             << "  \"gpu_draw_time_available\": "
+             << (metrics.gpuDrawTimeAvailable ? "true" : "false") << ",\n"
+             << "  \"gpu_draw_ms\": ";
+        if (metrics.gpuDrawTimeAvailable)
+        {
+            json << metrics.d3dGpuDrawMilliseconds;
+        }
+        else
+        {
+            json << "null";
+        }
+        json << ",\n"
+             << "  \"gpu_draw_time_source\": \""
+             << (metrics.gpuDrawTimeAvailable
+                     ? "D3D12 timestamp queries around canvas draw commands"
+                     : (direct2D
+                            ? "unavailable; Direct2D EndDraw is not GPU completion"
+                            : "unavailable; D3D12 timestamp queries were unavailable or invalid"))
+             << "\",\n"
+             << "  \"bitmap_blit_issue_ms\": ";
+        writeOptionalMetric(
+            direct2D, metrics.bitmapBlitIssueMilliseconds);
+        json << ",\n"
+             << "  \"hwnd_enddraw_elapsed_ms\": ";
+        writeOptionalMetric(direct2D, metrics.hwndEndDrawMilliseconds);
+        json << ",\n"
+             << "  \"d3d12_present_api_ms\": ";
+        writeOptionalMetric(
+            !direct2D, metrics.d3dPresentApiMilliseconds);
+        json << ",\n"
+             << "  \"d3d12_wait_for_frame_elapsed_ms\": ";
+        writeOptionalMetric(
+            !direct2D, metrics.d3dFrameFenceWaitMilliseconds);
+        json << ",\n"
+             << "  \"d3d12_final_fence_drain_ms\": ";
+        writeOptionalMetric(
+            !direct2D, metrics.d3dFinalFenceDrainMilliseconds);
+        json << "\n}\n";
+        benchmarkOutputJson_ = json.str();
+    }
+
     void StoreRendererBenchmarkJson(
         UINT measurementMilliseconds,
         std::uint64_t sceneHash,
@@ -2729,6 +3201,15 @@ private:
         ++direct2DCanvasUpdateCount_;
         direct2DCanvasUpdateTicks_ += elapsedTicks;
         direct2DNewlyRenderedCircleCount_ += newlyRenderedCircles;
+        if (circleThroughputBenchmarkActive_)
+        {
+            ++circleThroughputMetrics_.canvasUpdates;
+            circleThroughputMetrics_.circlesDrawnIntoCanvas +=
+                newlyRenderedCircles;
+            AddCircleThroughputElapsed(
+                circleThroughputMetrics_.canvasUpdateElapsedMilliseconds,
+                elapsedTicks);
+        }
         if (diagnosticsEnabled_)
         {
             ++direct2DDiagnosticCanvasUpdateCount_;
@@ -2876,11 +3357,51 @@ private:
         {
             direct2DBitmapTarget_->Clear(Direct2DCanvasClearColor());
         }
+        LARGE_INTEGER drawIssueStart{};
+        ULONGLONG drawIssueCycleStart = 0;
+        if (circleThroughputBenchmarkActive_ &&
+            (!QueryPerformanceCounter(&drawIssueStart) ||
+             !QueryThreadCycleTime(
+                 GetCurrentThread(), &drawIssueCycleStart)))
+        {
+            throw std::runtime_error(
+                "Could not start Direct2D canvas draw-command timing");
+        }
         for (std::size_t index = firstShape; index < endShape; ++index)
         {
             DrawDirect2DShape(drawingShapes_[index]);
         }
+        LARGE_INTEGER drawIssueStop{};
+        ULONGLONG drawIssueCycleStop = 0;
+        if (circleThroughputBenchmarkActive_ &&
+            (!QueryPerformanceCounter(&drawIssueStop) ||
+             !QueryThreadCycleTime(
+                 GetCurrentThread(), &drawIssueCycleStop)))
+        {
+            throw std::runtime_error(
+                "Could not stop Direct2D canvas draw-command timing");
+        }
+        LARGE_INTEGER canvasEndDrawStart{};
+        ULONGLONG canvasEndDrawCycleStart = 0;
+        if (circleThroughputBenchmarkActive_ &&
+            (!QueryPerformanceCounter(&canvasEndDrawStart) ||
+             !QueryThreadCycleTime(
+                 GetCurrentThread(), &canvasEndDrawCycleStart)))
+        {
+            throw std::runtime_error(
+                "Could not start Direct2D canvas EndDraw timing");
+        }
         const HRESULT result = direct2DBitmapTarget_->EndDraw();
+        LARGE_INTEGER canvasEndDrawStop{};
+        ULONGLONG canvasEndDrawCycleStop = 0;
+        if (circleThroughputBenchmarkActive_ &&
+            (!QueryPerformanceCounter(&canvasEndDrawStop) ||
+             !QueryThreadCycleTime(
+                 GetCurrentThread(), &canvasEndDrawCycleStop)))
+        {
+            throw std::runtime_error(
+                "Could not stop Direct2D canvas EndDraw timing");
+        }
         if (result == D2DERR_RECREATE_TARGET)
         {
             direct2DBitmap_.Reset();
@@ -2896,6 +3417,21 @@ private:
         direct2DDrawnShapeCount_ = endShape;
         canvasNeedsClear_ = false;
         canvasDirty_ = false;
+        if (circleThroughputBenchmarkActive_)
+        {
+            AddCircleThroughputElapsed(
+                circleThroughputMetrics_.canvasDrawCommandIssueMilliseconds,
+                static_cast<UINT64>(
+                    drawIssueStop.QuadPart - drawIssueStart.QuadPart));
+            AddCircleThroughputElapsed(
+                circleThroughputMetrics_.canvasUpdateEndDrawMilliseconds,
+                static_cast<UINT64>(
+                    canvasEndDrawStop.QuadPart - canvasEndDrawStart.QuadPart));
+            circleThroughputMetrics_.canvasDrawCommandIssueCycles +=
+                drawIssueCycleStop - drawIssueCycleStart;
+            circleThroughputMetrics_.canvasUpdateEndDrawCycles +=
+                canvasEndDrawCycleStop - canvasEndDrawCycleStart;
+        }
         LARGE_INTEGER updateStop{};
         if (!QueryPerformanceCounter(&updateStop))
         {
@@ -2958,10 +3494,150 @@ private:
                   << " adapter_selection_status=verified\n" << std::flush;
     }
 
+    void PrintLegacyMemoryDiagnostics()
+    {
+        const auto byteCount = [](std::size_t count, std::size_t elementSize,
+                                  std::size_t& bytes) {
+            if (elementSize != 0 &&
+                count > std::numeric_limits<std::size_t>::max() / elementSize)
+            {
+                return false;
+            }
+            bytes = count * elementSize;
+            return true;
+        };
+        const auto printVectorBytes = [&byteCount](
+                                          const char* name,
+                                          std::size_t size,
+                                          std::size_t capacity,
+                                          std::size_t elementSize) {
+            std::size_t sizeBytes = 0;
+            std::size_t capacityBytes = 0;
+            std::cout << "[diag][legacy-memory] " << name << "_size_bytes=";
+            if (byteCount(size, elementSize, sizeBytes))
+            {
+                std::cout << sizeBytes;
+            }
+            else
+            {
+                std::cout << "unavailable(overflow)";
+            }
+            std::cout << ' ' << name << "_capacity_bytes=";
+            if (byteCount(capacity, elementSize, capacityBytes))
+            {
+                std::cout << capacityBytes;
+            }
+            else
+            {
+                std::cout << "unavailable(overflow)";
+            }
+            std::cout << '\n';
+        };
+
+        printVectorBytes("vertices", vertices_.size(), vertices_.capacity(),
+                         sizeof(Vertex));
+        printVectorBytes("indices", indices_.size(), indices_.capacity(),
+                         sizeof(std::uint16_t));
+        printVectorBytes("circleDraws", circleDraws_.size(),
+                         circleDraws_.capacity(), sizeof(CircleDraw));
+        printVectorBytes("drawingShapes", drawingShapes_.size(),
+                         drawingShapes_.capacity(), sizeof(DrawingShape));
+        printVectorBytes("shapeCircleInstanceIndices",
+                         shapeCircleInstanceIndices_.size(),
+                         shapeCircleInstanceIndices_.capacity(), sizeof(UINT));
+        std::cout << "[diag][legacy-memory] current_vertex_buffer_capacity_bytes=";
+        if (vertexBuffer_)
+        {
+            std::cout << vertexBufferCapacityBytes_;
+        }
+        else
+        {
+            std::cout << "unavailable(no buffer)";
+        }
+        std::cout << " current_index_buffer_capacity_bytes=";
+        if (indexBuffer_)
+        {
+            std::cout << indexBufferCapacityBytes_;
+        }
+        else
+        {
+            std::cout << "unavailable(no buffer)";
+        }
+        std::cout << '\n';
+
+        UINT64 retiredVertexBytes = 0;
+        UINT64 retiredIndexBytes = 0;
+        bool retiredVertexBytesAvailable = true;
+        bool retiredIndexBytesAvailable = true;
+        const auto addRetiredCapacity = [](UINT64 capacity, UINT64& total) {
+            if (capacity > std::numeric_limits<UINT64>::max() - total)
+            {
+                return false;
+            }
+            total += capacity;
+            return true;
+        };
+        for (const RetiredGeometryBuffers& buffers : retiredGeometryBuffers_)
+        {
+            if (buffers.vertices &&
+                !addRetiredCapacity(buffers.vertices->GetDesc().Width,
+                                    retiredVertexBytes))
+            {
+                retiredVertexBytesAvailable = false;
+            }
+            if (buffers.indices &&
+                !addRetiredCapacity(buffers.indices->GetDesc().Width,
+                                    retiredIndexBytes))
+            {
+                retiredIndexBytesAvailable = false;
+            }
+        }
+        std::cout << "[diag][legacy-memory] retired_buffer_entries="
+                  << retiredGeometryBuffers_.size()
+                  << " retired_vertex_capacity_bytes=";
+        if (retiredVertexBytesAvailable)
+        {
+            std::cout << retiredVertexBytes;
+        }
+        else
+        {
+            std::cout << "unavailable(overflow)";
+        }
+        std::cout << " retired_index_capacity_bytes=";
+        if (retiredIndexBytesAvailable)
+        {
+            std::cout << retiredIndexBytes;
+        }
+        else
+        {
+            std::cout << "unavailable(overflow)";
+        }
+        std::cout << '\n';
+
+        PROCESS_MEMORY_COUNTERS_EX memory{};
+        memory.cb = sizeof(memory);
+        if (GetProcessMemoryInfo(
+                GetCurrentProcess(),
+                reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&memory),
+                sizeof(memory)))
+        {
+            std::cout << "[diag][legacy-memory] process_private_usage_bytes="
+                      << memory.PrivateUsage << '\n';
+        }
+        else
+        {
+            std::cout << "[diag][legacy-memory] process_private_usage_bytes="
+                         "unavailable(GetProcessMemoryInfo error "
+                      << GetLastError() << ")\n";
+        }
+        std::cout << std::flush;
+    }
+
     void RenderDirect2DFrame()
     {
         UpdateDirect2DCanvas();
-        const bool measure = direct2DBenchmarkActive_ || diagnosticsEnabled_;
+        const bool measure = direct2DBenchmarkActive_ || diagnosticsEnabled_ ||
+            circleThroughputBenchmarkActive_;
         LARGE_INTEGER frameStart{};
         if (measure && !QueryPerformanceCounter(&frameStart))
         {
@@ -3045,6 +3721,18 @@ private:
             }
             ThrowIfFailed(endDrawResult, "ID2D1RenderTarget::EndDraw");
             break;
+        }
+
+        if (circleThroughputBenchmarkActive_)
+        {
+            ++circleThroughputMetrics_.displayFrames;
+            AddCircleThroughputElapsed(
+                circleThroughputMetrics_.bitmapBlitIssueMilliseconds,
+                static_cast<UINT64>(issueStop.QuadPart - issueStart.QuadPart));
+            AddCircleThroughputElapsed(
+                circleThroughputMetrics_.hwndEndDrawMilliseconds,
+                static_cast<UINT64>(
+                    endDrawStop.QuadPart - endDrawStart.QuadPart));
         }
 
         LARGE_INTEGER frameStop{};
@@ -3553,6 +4241,17 @@ private:
         visualReadback_->Unmap(0, nullptr);
     }
 
+    void AddCircleThroughputElapsed(double& totalMilliseconds, UINT64 ticks) const
+    {
+        if (circleThroughputQpcFrequency_.QuadPart <= 0)
+        {
+            throw std::runtime_error(
+                "Circle-throughput QPC frequency is unavailable");
+        }
+        totalMilliseconds += static_cast<double>(ticks) * 1000.0 /
+            static_cast<double>(circleThroughputQpcFrequency_.QuadPart);
+    }
+
     void OnInteractiveShapeAdded()
     {
         if (!drawingShapes_.empty())
@@ -3581,8 +4280,9 @@ private:
             LARGE_INTEGER geometryStart{};
             LARGE_INTEGER uploadStart{};
             LARGE_INTEGER uploadStop{};
-            const bool measureStages = pipelineComparisonActive_ &&
-                timerComparisonPhase_ == TimerComparisonPhase::Measuring;
+            const bool measureStages = circleThroughputBenchmarkActive_ ||
+                (pipelineComparisonActive_ &&
+                 timerComparisonPhase_ == TimerComparisonPhase::Measuring);
             if (measureStages && !QueryPerformanceCounter(&geometryStart))
             {
                 throw std::runtime_error("QueryPerformanceCounter failed before geometry preparation");
@@ -3605,10 +4305,25 @@ private:
             CollectRetiredGeometryBuffers();
             if (measureStages)
             {
-                pipelineGeometryPrepTicks_ += static_cast<UINT64>(
+                const UINT64 geometryTicks = static_cast<UINT64>(
                     uploadStart.QuadPart - geometryStart.QuadPart);
-                pipelineGeometryUploadTicks_ += static_cast<UINT64>(
+                const UINT64 uploadTicks = static_cast<UINT64>(
                     uploadStop.QuadPart - uploadStart.QuadPart);
+                if (pipelineComparisonActive_ &&
+                    timerComparisonPhase_ == TimerComparisonPhase::Measuring)
+                {
+                    pipelineGeometryPrepTicks_ += geometryTicks;
+                    pipelineGeometryUploadTicks_ += uploadTicks;
+                }
+                if (circleThroughputBenchmarkActive_)
+                {
+                    AddCircleThroughputElapsed(
+                        circleThroughputMetrics_.rendererGeometryPreparationMilliseconds,
+                        geometryTicks);
+                    AddCircleThroughputElapsed(
+                        circleThroughputMetrics_.rendererGeometryUploadMilliseconds,
+                        uploadTicks);
+                }
             }
         }
         if (!randomDrawing_)
@@ -4198,7 +4913,8 @@ private:
         lastFrameDrawCallCount_ = 0;
         lastFrameRenderedCircleCount_ = 0;
         lastRendererFrameSample_ = {};
-        const bool measureRendererStages = rendererBenchmarkActive_;
+        const bool measureRendererStages =
+            rendererBenchmarkActive_ || circleThroughputBenchmarkActive_;
         LARGE_INTEGER recordStart{};
         ULONGLONG recordCycleStart = 0;
         if (measureRendererStages &&
@@ -4482,6 +5198,17 @@ private:
                 executeStop.QuadPart - recordStop.QuadPart);
             rendererBenchmarkRecordCycles_ += recordCycleStop - recordCycleStart;
             rendererBenchmarkExecuteCycles_ += executeCycleStop - recordCycleStop;
+            if (circleThroughputBenchmarkActive_)
+            {
+                AddCircleThroughputElapsed(
+                    circleThroughputMetrics_.rendererCommandRecordMilliseconds,
+                    static_cast<UINT64>(
+                        recordStop.QuadPart - recordStart.QuadPart));
+                AddCircleThroughputElapsed(
+                    circleThroughputMetrics_.rendererCommandExecuteMilliseconds,
+                    static_cast<UINT64>(
+                        executeStop.QuadPart - recordStop.QuadPart));
+            }
         }
     }
 
@@ -6079,6 +6806,15 @@ float4 PSMain(PSInput input) : SV_TARGET
     std::vector<Direct2DFrameSample> direct2DBenchmarkSamples_;
     bool direct2DBenchmarkActive_ = false;
     UINT64 direct2DScenePreparationTicks_ = 0;
+    bool circleThroughputBenchmarkEnabled_ = false;
+    bool circleThroughputBenchmarkActive_ = false;
+    UINT circleThroughputBatchSize_ = kMaximumAdaptiveBatchSize;
+    UINT circleThroughputTargetCount_ = 0;
+    std::uint64_t circleThroughputSceneHash_ = 0;
+    LARGE_INTEGER circleThroughputQpcFrequency_{};
+    UINT64 circleThroughputScenePreparationTicks_ = 0;
+    std::vector<DrawingShape> circleThroughputShapes_;
+    CircleThroughputMetrics circleThroughputMetrics_;
     std::size_t direct2DDrawnShapeCount_ = 0;
     UINT64 direct2DNewlyRenderedCircleCount_ = 0;
     UINT64 direct2DCanvasUpdateCount_ = 0;
@@ -6140,6 +6876,32 @@ CommandLineOptions ParseCommandLine()
         if (argument == L"--render-benchmark")
         {
             options.renderBenchmark = true;
+            continue;
+        }
+        if (argument == L"--circle-throughput-benchmark")
+        {
+            options.circleThroughputBenchmark = true;
+            continue;
+        }
+        if (argument == L"--circle-batch-size")
+        {
+            const std::wstring value = nextValue();
+            if (value.empty() ||
+                std::any_of(value.begin(), value.end(), [](wchar_t character) {
+                    return character < L'0' || character > L'9';
+                }))
+            {
+                throw std::runtime_error(
+                    "--circle-batch-size requires a positive integer from 1 to 512.");
+            }
+            const unsigned long parsedValue = std::stoul(value);
+            if (parsedValue == 0 || parsedValue > kMaximumAdaptiveBatchSize)
+            {
+                throw std::runtime_error(
+                    "--circle-batch-size must be between 1 and 512.");
+            }
+            options.circleBatchSize = static_cast<UINT>(parsedValue);
+            options.circleBatchSizeSpecified = true;
             continue;
         }
         if (argument == L"--gpu-benchmark")
@@ -6245,6 +7007,25 @@ CommandLineOptions ParseCommandLine()
         throw std::runtime_error(
             "--gpu-benchmark requires an explicit --circles N value.");
     }
+    if (options.circleThroughputBenchmark && !options.circlesSpecified)
+    {
+        throw std::runtime_error(
+            "--circle-throughput-benchmark requires an explicit --circles N value.");
+    }
+    if (options.circleBatchSizeSpecified &&
+        !options.circleThroughputBenchmark)
+    {
+        throw std::runtime_error(
+            "--circle-batch-size is supported only with --circle-throughput-benchmark.");
+    }
+    if (options.circleThroughputBenchmark &&
+        (options.benchmark || options.renderBenchmark || options.gpuBenchmark ||
+         options.timerComparison || options.pipelineComparison ||
+         options.visualCapture || options.diagnostics))
+    {
+        throw std::runtime_error(
+            "--circle-throughput-benchmark cannot be combined with other benchmark, comparison, capture, or diagnostic modes.");
+    }
     if (options.gpuBenchmark &&
         (options.benchmark || options.renderBenchmark ||
          options.timerComparison || options.pipelineComparison ||
@@ -6277,17 +7058,19 @@ CommandLineOptions ParseCommandLine()
         throw std::runtime_error(
             "--render-benchmark cannot be combined with --benchmark or --timer-compare.");
     }
-    if (!options.outputFile.empty() && !options.renderBenchmark)
+    if (!options.outputFile.empty() && !options.renderBenchmark &&
+        !options.circleThroughputBenchmark)
     {
         throw std::runtime_error(
-            "--output-file is supported only with --render-benchmark.");
+            "--output-file is supported only with --render-benchmark or --circle-throughput-benchmark.");
     }
     if (options.rendererMode == RendererMode::Direct2D &&
         (options.benchmark || options.gpuBenchmark ||
          options.pipelineComparison || options.visualCapture))
     {
         throw std::runtime_error(
-            "Direct2D supports interactive rendering and --render-benchmark; "
+            "Direct2D supports interactive rendering, --render-benchmark, and "
+            "--circle-throughput-benchmark; "
             "--benchmark, --gpu-benchmark, --pipeline-compare, and "
             "--visual-capture use D3D12-specific infrastructure.");
     }
@@ -6474,13 +7257,16 @@ int WINAPI wWinMain(
         {
             MessageBoxW(
                 nullptr,
-                L"Usage: main.exe [--renderer legacy|shader|direct2d] [--gpu auto|igpu|dgpu] [--circles 1|128|1000|5000|10000] [--benchmark|--render-benchmark|--gpu-benchmark|--visual-capture] [--output-file path.json] [--diagnostics] [--timer-mode wm|qpc] [--timer-compare] [--pipeline-compare]\n"
+                L"Usage: main.exe [--renderer legacy|shader|direct2d] [--gpu auto|igpu|dgpu] [--circles 1|128|1000|5000|10000] [--benchmark|--render-benchmark|--circle-throughput-benchmark|--gpu-benchmark|--visual-capture] [--circle-batch-size 1..512] [--output-file path.json] [--diagnostics] [--timer-mode wm|qpc] [--timer-compare] [--pipeline-compare]\n"
                 L"Interactive mode starts with an empty canvas.\n"
                 L"--benchmark defaults to one circle if --circles is omitted.\n"
                 L"The 128-circle scene is generated with a fixed seed.\n"
                 L"--circles also accepts 1000, 5000, and 10000 for renderer scaling tests.\n"
                 L"--benchmark runs five CPU command-submission measurements.\n"
                 L"--render-benchmark presents the selected renderer for 3 s warm-up and 5 s measurement.\n"
+                L"--circle-throughput-benchmark incrementally adds the seed-fixed scene in batches and measures added/drawn circles per second; requires --circles N.\n"
+                L"--circle-batch-size N selects a fixed throughput batch from 1 to 512 (default 512).\n"
+                L"--output-file also writes the circle-throughput result as UTF-8 JSON.\n"
                 L"--output-file path.json writes the successful --render-benchmark result as UTF-8 JSON with status and exit_code.\n"
                 L"--renderer direct2d uses ID2D1HwndRenderTarget; its render benchmark reports CPU-side draw issue and EndDraw timings, not GPU execution time.\n"
                 L"--gpu-benchmark requires --circles N, prepares a fixed scene, warms up for 3 s, and measures GPU draw timestamps for 10 s.\n"
@@ -6489,6 +7275,7 @@ int WINAPI wWinMain(
                 L"--gpu auto preserves the default adapter selection; igpu selects AMD Radeon 890M; dgpu selects NVIDIA GeForce RTX 4060 Laptop GPU.\n"
                 L"Direct2D HWND targets do not expose or guarantee --gpu adapter selection; diagnostics report the adapter as unknown.\n"
                 L"--diagnostics reports Present, frame-wait, and object-add timings.\n"
+                L"For Legacy, --diagnostics also reports CPU vector size/capacity, current and retired D3D12 geometry-buffer capacities, and process PrivateUsage once per second under [diag][legacy-memory].\n"
                 L"For Direct2D, --diagnostics reports EndDraw CPU-time estimate and elapsed time separately, plus explicit WaitMessage time; neither is GPU time.\n"
                 L"--timer-mode qpc uses QPC scheduling instead of WM_TIMER.\n"
                 L"--timer-compare runs both modes at 10, 5, and 1 ms.\n"
@@ -6504,10 +7291,14 @@ int WINAPI wWinMain(
             : options.circleCount;
         app.SetCircleCount(circleCount);
         app.SetBenchmarkEnabled(
-            options.benchmark || options.renderBenchmark || options.gpuBenchmark);
+            options.benchmark || options.renderBenchmark || options.gpuBenchmark ||
+            options.circleThroughputBenchmark);
         app.SetRendererMode(options.rendererMode);
         app.SetGpuSelection(options.gpuSelection);
         app.SetRenderBenchmarkEnabled(options.renderBenchmark);
+        app.SetCircleThroughputBenchmarkEnabled(
+            options.circleThroughputBenchmark);
+        app.SetCircleThroughputBatchSize(options.circleBatchSize);
         app.SetPipelineComparisonEnabled(options.pipelineComparison);
         app.SetDiagnosticsEnabled(options.diagnostics);
         app.SetDrawingTimerMode(options.drawingTimerMode);
@@ -6518,7 +7309,8 @@ int WINAPI wWinMain(
         app.SetBenchmarkOutputFile(options.outputFile);
         if (options.benchmark || options.renderBenchmark || options.gpuBenchmark ||
             options.visualCapture || options.diagnostics ||
-            options.timerComparison || options.pipelineComparison)
+            options.timerComparison || options.pipelineComparison ||
+            options.circleThroughputBenchmark)
         {
             if (options.outputFile.empty())
             {
@@ -6538,7 +7330,8 @@ int WINAPI wWinMain(
             throw std::runtime_error("RegisterClassExW failed");
         }
         if (!options.benchmark && !options.renderBenchmark &&
-            !options.gpuBenchmark && !options.visualCapture)
+            !options.circleThroughputBenchmark && !options.gpuBenchmark &&
+            !options.visualCapture)
         {
             RegisterCanvasWindowClass(instance);
         }
@@ -6572,7 +7365,8 @@ int WINAPI wWinMain(
         }
 
         if (options.benchmark || options.renderBenchmark ||
-            options.gpuBenchmark || options.visualCapture)
+            options.circleThroughputBenchmark || options.gpuBenchmark ||
+            options.visualCapture)
         {
             app.AttachWindow(window);
         }
@@ -6631,6 +7425,20 @@ int WINAPI wWinMain(
             app.WriteBenchmarkOutputFile();
             return 0;
         }
+        if (options.circleThroughputBenchmark)
+        {
+            ShowWindow(window, showCommand);
+            UpdateWindow(window);
+            app.Render();
+            if (options.rendererMode != RendererMode::Direct2D)
+            {
+                app.WaitForGpu();
+            }
+            app.RunCircleThroughputBenchmark();
+            app.Shutdown();
+            app.WriteBenchmarkOutputFile();
+            return 0;
+        }
         if (options.visualCapture)
         {
             const std::wstring output =
@@ -6645,6 +7453,7 @@ int WINAPI wWinMain(
         ShowWindow(window, showCommand);
         UpdateWindow(window);
         if (!options.benchmark && !options.renderBenchmark &&
+            !options.circleThroughputBenchmark &&
             SetTimer(window, kInformationTimerId, 1000, nullptr) == 0)
         {
             throw std::runtime_error("SetTimer(information panel) failed");
