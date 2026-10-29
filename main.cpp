@@ -99,6 +99,7 @@ constexpr UINT kPipelineComparisonMeasurementMs = 5000;
 constexpr std::size_t kPipelineComparisonSampleCapacity = 8192;
 constexpr UINT kZeroIntervalBatchSize = 128;
 constexpr UINT kMaximumAdaptiveBatchSize = 512;
+constexpr UINT kLegacyResizeRebuildChunkBytes = 8U * 1024U * 1024U;
 constexpr UINT kSlowWindowsToEnableBatching = 3;
 constexpr UINT kFastWindowsToDisableBatching = 6;
 constexpr ULONGLONG kBatchingModeMinimumDurationMs = 5000;
@@ -485,6 +486,7 @@ public:
             return;
         }
         rendererMode_ = mode;
+        UpdateRendererLabel();
         if (interactiveLayout_ && device_)
         {
             RebuildInteractiveGeometry();
@@ -549,6 +551,76 @@ public:
     void SetDrawingTimerMode(DrawingTimerMode mode)
     {
         drawingTimerMode_ = mode;
+    }
+
+    bool CanUseLegacyIdleRendering() const
+    {
+        return CanUseLegacyRandomBatchRendering() &&
+            !diagnosticsEnabled_ && !rendererBenchmarkActive_ &&
+            !visualCaptureEnabled_;
+    }
+
+    bool HasLegacyInteractiveRenderPending() const
+    {
+        return legacyIdleFramePending_ || canvasDirty_ || canvasNeedsClear_ ||
+            resizePending_ || legacyRandomBatchPending_ ||
+            legacyResizeRebuildActive_;
+    }
+
+    void RequestLegacyInteractiveRender()
+    {
+        legacyIdleFramePending_ = true;
+    }
+
+    void WaitForLegacyInteractiveWork()
+    {
+        DWORD timeout = INFINITE;
+        if (randomDrawing_ && drawingTimerMode_ == DrawingTimerMode::Qpc)
+        {
+            if (drawIntervalMs_ == 0)
+            {
+                timeout = 0;
+            }
+            else
+            {
+                LARGE_INTEGER now{};
+                if (!QueryPerformanceCounter(&now))
+                {
+                    throw std::runtime_error(
+                        "QueryPerformanceCounter failed before idle wait");
+                }
+                const LONGLONG remainingTicks =
+                    nextDrawingDeadline_.QuadPart - now.QuadPart;
+                if (remainingTicks <= 0)
+                {
+                    timeout = 0;
+                }
+                else
+                {
+                    if (drawingQpcFrequency_.QuadPart <= 0)
+                    {
+                        throw std::runtime_error(
+                            "QPC frequency is invalid during idle wait");
+                    }
+                    const long double remainingMilliseconds = std::ceil(
+                        static_cast<long double>(remainingTicks) * 1000.0L /
+                        static_cast<long double>(
+                            drawingQpcFrequency_.QuadPart));
+                    timeout = static_cast<DWORD>(std::clamp(
+                        remainingMilliseconds,
+                        1.0L,
+                        static_cast<long double>(INFINITE - 1)));
+                }
+            }
+        }
+
+        const DWORD waitResult = MsgWaitForMultipleObjectsEx(
+            0, nullptr, timeout, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+        if (waitResult == WAIT_FAILED)
+        {
+            throw std::runtime_error(
+                "MsgWaitForMultipleObjectsEx failed in Legacy idle rendering");
+        }
     }
 
     void SetInteractiveLayout(bool enabled)
@@ -689,10 +761,10 @@ public:
             250,
             228,
             32);
-        label(kRendererLabelId, L"Renderer: Direct3D 12 (HW backend)",
+        label(kRendererLabelId, RendererDisplayName(rendererMode_),
               12, 294, 236, 20);
         label(kVsyncLabelId, L"VSync vypnuta", 12, 316, 236, 20);
-        label(kHintLabelId, L"SDL kruznice jsou aproximovane useckami.",
+        label(kHintLabelId, L"",
               12, 390, 236, 22);
         label(kObjectCountLabelId, L"Pocet objektu: 0", 12, 418, 236, 20);
         label(kObjectMemoryLabelId, L"Odhad dat objektu (ne proces): 0 B",
@@ -848,6 +920,16 @@ public:
 
     void HandleInformationTimer()
     {
+        if (CanUseLegacyIdleRendering() && !randomDrawing_ &&
+            !legacyResizeRebuildActive_)
+        {
+            const ULONGLONG previousWindowStart = speedWindowStartMs_;
+            UpdateDrawingRateWindow();
+            if (speedWindowStartMs_ != previousWindowStart)
+            {
+                return;
+            }
+        }
         UpdateInformationPanel();
     }
 
@@ -882,6 +964,12 @@ public:
         {
             return 0;
         }
+        if (minimized_ && CanUseLegacyRandomBatchRendering())
+        {
+            legacyRandomDrawingPausedForMinimize_ = true;
+            return 0;
+        }
+        ResumeLegacyRandomDrawingAfterMinimize();
         const UINT requestedBatchSize = SelectDrawingBatchSize();
         if (requestedBatchSize == 0)
         {
@@ -1068,6 +1156,12 @@ public:
         {
             return;
         }
+        if (minimized_ && CanUseLegacyRandomBatchRendering())
+        {
+            legacyRandomDrawingPausedForMinimize_ = true;
+            return;
+        }
+        ResumeLegacyRandomDrawingAfterMinimize();
 
         LARGE_INTEGER now{};
         if (!QueryPerformanceCounter(&now))
@@ -1115,6 +1209,40 @@ public:
                 nextDrawingDeadline_.QuadPart += drawingIntervalTicks_;
                 ++qpcSkippedDeadlines_;
             }
+        }
+    }
+
+    void ResumeLegacyRandomDrawingAfterMinimize()
+    {
+        if (!legacyRandomDrawingPausedForMinimize_ || minimized_)
+        {
+            return;
+        }
+        if (!randomDrawing_ || !CanUseLegacyRandomBatchRendering())
+        {
+            legacyRandomDrawingPausedForMinimize_ = false;
+            return;
+        }
+
+        legacyRandomDrawingPausedForMinimize_ = false;
+        const ULONGLONG now = GetTickCount64();
+        drawingRunStartMs_ = now;
+        generatedShapeCountThisRun_ = 0;
+        speedWindowStartMs_ = now;
+        generatedInSpeedWindow_ = pendingGeneratedShapesForPresent_;
+        renderedInSpeedWindow_ = 0;
+        slowWindowCount_ = 0;
+        fastWindowCount_ = 0;
+        if (drawingTimerMode_ == DrawingTimerMode::Qpc)
+        {
+            if (!QueryPerformanceCounter(&drawingStartQpc_))
+            {
+                throw std::runtime_error(
+                    "QueryPerformanceCounter failed when resuming QPC drawing");
+            }
+            nextDrawingDeadline_ = drawingStartQpc_;
+            nextDrawingDeadline_.QuadPart +=
+                drawIntervalMs_ == 0 ? 1 : drawingIntervalTicks_;
         }
     }
 
@@ -1316,6 +1444,10 @@ public:
         if (width == 0 || height == 0)
         {
             minimized_ = true;
+            if (randomDrawing_ && CanUseLegacyRandomBatchRendering())
+            {
+                legacyRandomDrawingPausedForMinimize_ = true;
+            }
             return;
         }
 
@@ -1323,6 +1455,7 @@ public:
         pendingWidth_ = width;
         pendingHeight_ = height;
         resizePending_ = true;
+        RequestLegacyInteractiveRender();
     }
 
     void Initialize()
@@ -1510,6 +1643,10 @@ public:
             RenderDirect2DFrame();
             return;
         }
+        if (legacyResizeRebuildActive_ && !legacyRandomBatchPending_)
+        {
+            PrepareNextLegacyResizeRebuildChunk();
+        }
 
         LARGE_INTEGER frameStart{};
         LARGE_INTEGER throughputWaitStart{};
@@ -1524,6 +1661,14 @@ public:
 
         const UINT frameIndex = swapChain_->GetCurrentBackBufferIndex();
         WaitForFrame(frameIndex);
+        if (legacyRandomBatchActive_ || legacyRandomBatchPending_)
+        {
+            CollectRetiredGeometryBuffers();
+            if (legacyRandomBatchPending_)
+            {
+                UploadLegacyRandomBatch(frameIndex);
+            }
+        }
         LARGE_INTEGER throughputWaitStop{};
         if (circleThroughputBenchmarkActive_)
         {
@@ -1665,9 +1810,49 @@ public:
                 signalEnd.QuadPart - presentEnd.QuadPart);
             ReportDiagnosticsIfDue();
         }
-        renderedInSpeedWindow_ += pendingGeneratedShapesForPresent_;
-        pendingGeneratedShapesForPresent_ = 0;
-        UpdateDrawingRateWindow();
+        legacyIdleFramePending_ = false;
+        if (legacyRandomBatchPending_)
+        {
+            vertices_.clear();
+            indices_.clear();
+            circleDraws_.clear();
+            shapeCircleInstanceIndices_.clear();
+            lastUploadedVertexCount_ = 0;
+            lastUploadedIndexCount_ = 0;
+            canvasRenderedShapeCount_ = 0;
+            legacyRandomBatchPending_ = false;
+            if (legacyResizeRebuildActive_ &&
+                legacyResizeRebuildChunkEnd_ > legacyResizeRebuildCursor_)
+            {
+                legacyResizeRebuildCursor_ =
+                    legacyResizeRebuildChunkEnd_;
+                legacyResizeRebuildChunkEnd_ = 0;
+                if (legacyResizeRebuildCursor_ >= drawingShapes_.size())
+                {
+                    legacyResizeRebuildActive_ = false;
+                }
+                else
+                {
+                    canvasDirty_ = true;
+                    RequestLegacyInteractiveRender();
+                }
+            }
+            if (!randomDrawing_ && !legacyResizeRebuildActive_)
+            {
+                legacyRandomBatchActive_ = false;
+            }
+        }
+        if (!legacyResizeRebuildActive_)
+        {
+            renderedInSpeedWindow_ += pendingGeneratedShapesForPresent_;
+            pendingGeneratedShapesForPresent_ = 0;
+            UpdateDrawingRateWindow();
+        }
+        if (clearDrawingAfterLegacyRandomBatch_)
+        {
+            clearDrawingAfterLegacyRandomBatch_ = false;
+            ClearDrawing();
+        }
     }
 
     void ReportDiagnosticsIfDue()
@@ -2703,6 +2888,14 @@ public:
         }
         indexBuffer_.Reset();
         vertexBuffer_.Reset();
+        for (auto& buffer : legacyBatchIndexBuffers_)
+        {
+            buffer.Reset();
+        }
+        for (auto& buffer : legacyBatchVertexBuffers_)
+        {
+            buffer.Reset();
+        }
         shaderInstanceBuffer_.Reset();
         shaderPipelineState_.Reset();
         shaderRootSignature_.Reset();
@@ -3892,7 +4085,22 @@ private:
     void ClearDrawing()
     {
         StopRandomDrawing();
+        if (legacyRandomBatchPending_)
+        {
+            if (minimized_)
+            {
+                clearDrawingAfterLegacyRandomBatch_ = true;
+                return;
+            }
+            Render();
+        }
         std::vector<DrawingShape>().swap(drawingShapes_);
+        legacyRandomBatchScene_ = false;
+        legacyRandomBatchActive_ = false;
+        legacyRandomBatchPending_ = false;
+        legacyResizeRebuildActive_ = false;
+        legacyResizeRebuildCursor_ = 0;
+        legacyResizeRebuildChunkEnd_ = 0;
         lastUploadedVertexCount_ = 0;
         lastUploadedIndexCount_ = 0;
         pendingPoint_ = false;
@@ -3909,6 +4117,7 @@ private:
         canvasRenderedShapeCount_ = 0;
         canvasNeedsClear_ = true;
         canvasDirty_ = true;
+        RequestLegacyInteractiveRender();
         RebuildInteractiveGeometry();
         UpdateInformationPanel();
     }
@@ -3927,6 +4136,25 @@ private:
         case RendererMode::Direct2D: return "direct2d";
         }
         return "unknown";
+    }
+
+    static const wchar_t* RendererDisplayName(RendererMode mode)
+    {
+        switch (mode)
+        {
+        case RendererMode::Legacy: return L"Renderer: Legacy (Direct3D 12)";
+        case RendererMode::Shader: return L"Renderer: Shader (Direct3D 12)";
+        case RendererMode::Direct2D: return L"Renderer: Direct2D";
+        }
+        return L"Renderer: Unknown";
+    }
+
+    void UpdateRendererLabel()
+    {
+        if (HWND rendererLabel = Control(kRendererLabelId))
+        {
+            SetWindowTextW(rendererLabel, RendererDisplayName(rendererMode_));
+        }
     }
 
     static const char* PipelineScenarioName(PipelineComparisonScenario scenario)
@@ -4268,9 +4496,21 @@ private:
         {
             return;
         }
-        objectCount_ = drawingShapes_.size();
+        objectCount_ += shapeCount;
         objectMemoryBytes_ = drawingShapes_.capacity() * sizeof(DrawingShape);
+        if (randomDrawing_ && CanUseLegacyRandomBatchRendering() &&
+            !legacyRandomBatchActive_)
+        {
+            EnableLegacyRandomBatchRendering();
+        }
         if (rendererMode_ == RendererMode::Direct2D)
+        {
+            canvasDirty_ = true;
+        }
+        else if (interactiveGeometryEnabled_ &&
+                 legacyResizeRebuildActive_ &&
+                 legacyRandomBatchScene_ &&
+                 CanUseLegacyRandomBatchRendering())
         {
             canvasDirty_ = true;
         }
@@ -4296,8 +4536,15 @@ private:
             {
                 throw std::runtime_error("QueryPerformanceCounter failed after geometry preparation");
             }
-            UploadInteractiveGeometryTail();
-            UploadShaderInstanceTail();
+            if (legacyRandomBatchActive_)
+            {
+                legacyRandomBatchPending_ = true;
+            }
+            else
+            {
+                UploadInteractiveGeometryTail();
+                UploadShaderInstanceTail();
+            }
             if (measureStages && !QueryPerformanceCounter(&uploadStop))
             {
                 throw std::runtime_error("QueryPerformanceCounter failed after geometry upload");
@@ -4326,10 +4573,128 @@ private:
                 }
             }
         }
+        RequestLegacyInteractiveRender();
         if (!randomDrawing_)
         {
             UpdateInformationPanel();
         }
+    }
+
+    bool CanUseLegacyRandomBatchRendering() const
+    {
+        return rendererMode_ == RendererMode::Legacy &&
+            interactiveLayout_ && !benchmarkEnabled_ &&
+            !timerComparisonActive_ && !pipelineComparisonActive_ &&
+            !circleThroughputBenchmarkActive_;
+    }
+
+    void EnableLegacyRandomBatchRendering()
+    {
+        if (legacyRandomBatchActive_ || !CanUseLegacyRandomBatchRendering())
+        {
+            return;
+        }
+        if (canvasDirty_ && !circleDraws_.empty())
+        {
+            if (minimized_)
+            {
+                return;
+            }
+            Render();
+        }
+
+        RetireCurrentGeometryBuffers();
+        vertexBufferCapacityBytes_ = 0;
+        indexBufferCapacityBytes_ = 0;
+        vertexBufferView_ = {};
+        indexBufferView_ = {};
+        lastUploadedVertexCount_ = 0;
+        lastUploadedIndexCount_ = 0;
+        vertices_.clear();
+        indices_.clear();
+        circleDraws_.clear();
+        shapeCircleInstanceIndices_.clear();
+        canvasRenderedShapeCount_ = 0;
+        legacyRandomBatchActive_ = true;
+        legacyRandomBatchScene_ = true;
+        CollectRetiredGeometryBuffers();
+    }
+
+    void UploadLegacyRandomBatch(UINT frameIndex)
+    {
+        if (vertices_.empty() || indices_.empty())
+        {
+            return;
+        }
+        if (vertices_.size() >
+                std::numeric_limits<UINT>::max() / sizeof(Vertex) ||
+            indices_.size() >
+                std::numeric_limits<UINT>::max() /
+                    sizeof(std::uint16_t))
+        {
+            throw std::overflow_error(
+                "Legacy interactive batch exceeds D3D12 view sizes");
+        }
+
+        const UINT vertexBytes =
+            static_cast<UINT>(vertices_.size() * sizeof(Vertex));
+        const UINT indexBytes =
+            static_cast<UINT>(indices_.size() * sizeof(std::uint16_t));
+        auto& vertexBuffer = legacyBatchVertexBuffers_[frameIndex];
+        auto& indexBuffer = legacyBatchIndexBuffers_[frameIndex];
+        UINT& vertexCapacity = legacyBatchVertexCapacities_[frameIndex];
+        UINT& indexCapacity = legacyBatchIndexCapacities_[frameIndex];
+
+        if (vertexBytes > vertexCapacity)
+        {
+            const UINT capacity = NextBufferCapacity(vertexCapacity, vertexBytes);
+            ComPtr<ID3D12Resource> newBuffer;
+            CreateUploadBuffer(
+                vertices_.data(), vertexBytes, capacity, &newBuffer,
+                "legacy interactive batch vertex buffer");
+            vertexBuffer = std::move(newBuffer);
+            vertexCapacity = capacity;
+        }
+        else
+        {
+            void* mapped = nullptr;
+            D3D12_RANGE readRange{0, 0};
+            ThrowIfFailed(
+                vertexBuffer->Map(0, &readRange, &mapped),
+                "Map(legacy interactive batch vertex buffer)");
+            std::memcpy(mapped, vertices_.data(), vertexBytes);
+            vertexBuffer->Unmap(0, nullptr);
+        }
+
+        if (indexBytes > indexCapacity)
+        {
+            const UINT capacity = NextBufferCapacity(indexCapacity, indexBytes);
+            ComPtr<ID3D12Resource> newBuffer;
+            CreateUploadBuffer(
+                indices_.data(), indexBytes, capacity, &newBuffer,
+                "legacy interactive batch index buffer");
+            indexBuffer = std::move(newBuffer);
+            indexCapacity = capacity;
+        }
+        else
+        {
+            void* mapped = nullptr;
+            D3D12_RANGE readRange{0, 0};
+            ThrowIfFailed(
+                indexBuffer->Map(0, &readRange, &mapped),
+                "Map(legacy interactive batch index buffer)");
+            std::memcpy(mapped, indices_.data(), indexBytes);
+            indexBuffer->Unmap(0, nullptr);
+        }
+
+        vertexBufferView_.BufferLocation =
+            vertexBuffer->GetGPUVirtualAddress();
+        vertexBufferView_.SizeInBytes = vertexBytes;
+        vertexBufferView_.StrideInBytes = sizeof(Vertex);
+        indexBufferView_.BufferLocation =
+            indexBuffer->GetGPUVirtualAddress();
+        indexBufferView_.SizeInBytes = indexBytes;
+        indexBufferView_.Format = DXGI_FORMAT_R16_UINT;
     }
 
     bool GenerateRandomShape()
@@ -4404,12 +4769,32 @@ private:
         circleDraws_.clear();
         shaderCircleInstances_.clear();
         shapeCircleInstanceIndices_.clear();
+        if (legacyRandomBatchScene_ &&
+            CanUseLegacyRandomBatchRendering())
+        {
+            legacyRandomBatchPending_ = false;
+            legacyResizeRebuildCursor_ = 0;
+            legacyResizeRebuildChunkEnd_ = 0;
+            legacyResizeRebuildActive_ = !drawingShapes_.empty();
+            legacyRandomBatchActive_ =
+                legacyResizeRebuildActive_ || randomDrawing_;
+            if (legacyResizeRebuildActive_)
+            {
+                canvasDirty_ = true;
+                RequestLegacyInteractiveRender();
+            }
+            return;
+        }
+        legacyResizeRebuildActive_ = false;
+        legacyResizeRebuildCursor_ = 0;
+        legacyResizeRebuildChunkEnd_ = 0;
         for (const DrawingShape& shape : drawingShapes_)
         {
             AppendInteractiveShapeGeometry(shape);
         }
         if (vertices_.empty() && shaderCircleInstances_.empty())
         {
+            legacyRandomBatchPending_ = false;
             vertexBuffer_.Reset();
             indexBuffer_.Reset();
             shaderInstanceBuffer_.Reset();
@@ -4437,9 +4822,93 @@ private:
         }
         else
         {
-            UploadCircleBuffers();
+            if (legacyRandomBatchScene_ &&
+                CanUseLegacyRandomBatchRendering())
+            {
+                legacyRandomBatchPending_ = !circleDraws_.empty();
+            }
+            else
+            {
+                UploadCircleBuffers();
+            }
         }
         UploadShaderInstanceBuffer();
+    }
+
+    void PrepareNextLegacyResizeRebuildChunk()
+    {
+        vertices_.clear();
+        indices_.clear();
+        circleDraws_.clear();
+        shapeCircleInstanceIndices_.clear();
+
+        const std::size_t maxVertexCount =
+            kLegacyResizeRebuildChunkBytes / sizeof(Vertex);
+        const std::size_t maxIndexCount =
+            kLegacyResizeRebuildChunkBytes / sizeof(std::uint16_t);
+        std::size_t chunkEnd = legacyResizeRebuildCursor_;
+        while (chunkEnd < drawingShapes_.size())
+        {
+            std::size_t requiredVertices = 0;
+            std::size_t requiredIndices = 0;
+            GetLegacyShapeGeometryCounts(
+                drawingShapes_[chunkEnd], requiredVertices, requiredIndices);
+            if (requiredVertices > maxVertexCount - vertices_.size() ||
+                requiredIndices > maxIndexCount - indices_.size())
+            {
+                if (chunkEnd == legacyResizeRebuildCursor_)
+                {
+                    throw std::overflow_error(
+                        "A Legacy shape exceeds the resize rebuild chunk limits");
+                }
+                break;
+            }
+
+            AppendInteractiveShapeGeometry(drawingShapes_[chunkEnd]);
+            ++chunkEnd;
+        }
+
+        if (chunkEnd == legacyResizeRebuildCursor_)
+        {
+            legacyResizeRebuildActive_ = false;
+            if (!randomDrawing_)
+            {
+                legacyRandomBatchActive_ = false;
+            }
+            return;
+        }
+
+        legacyResizeRebuildChunkEnd_ = chunkEnd;
+        legacyRandomBatchPending_ = true;
+        canvasDirty_ = true;
+    }
+
+    static UINT LegacyCircleSegmentCount(const DrawingShape& shape)
+    {
+        constexpr float twoPi = 6.28318530717958647692f;
+        const float radius = std::max(
+            1.0f, (static_cast<float>(shape.x2 - shape.x1)) * 0.5f);
+        return std::clamp(
+            static_cast<UINT>(twoPi * radius / 3.0f),
+            kMinimumSegments, kMaximumSegments);
+    }
+
+    static void GetLegacyShapeGeometryCounts(
+        const DrawingShape& shape,
+        std::size_t& vertexCount,
+        std::size_t& indexCount)
+    {
+        if (shape.circle)
+        {
+            const UINT segments = LegacyCircleSegmentCount(shape);
+            vertexCount = 2U * (static_cast<std::size_t>(segments) + 1U);
+            indexCount = 6U * static_cast<std::size_t>(segments);
+        }
+        else
+        {
+            vertexCount = 4;
+            indexCount = 6;
+        }
     }
 
     void AppendInteractiveShapeGeometry(const DrawingShape& shape)
@@ -4486,9 +4955,7 @@ private:
                        static_cast<float>(shape.y2)) * 0.5f;
             const float radius = std::max(
                 1.0f, (static_cast<float>(shape.x2 - shape.x1)) * 0.5f);
-            segments = std::clamp(
-                static_cast<UINT>(twoPi * radius / 3.0f),
-                kMinimumSegments, kMaximumSegments);
+            segments = LegacyCircleSegmentCount(shape);
             const float innerRadius = std::max(
                 0.0f, radius - static_cast<float>(shape.thickness));
             const float red = static_cast<float>(GetRValue(shape.color)) / 255.0f;
@@ -4753,6 +5220,7 @@ private:
     bool StartRandomDrawing()
     {
         randomDrawing_ = true;
+        legacyRandomDrawingPausedForMinimize_ = false;
         generatedInSpeedWindow_ = 0;
         renderedInSpeedWindow_ = 0;
         pendingGeneratedShapesForPresent_ = 0;
@@ -4806,6 +5274,7 @@ private:
                 return false;
             }
         }
+        EnableLegacyRandomBatchRendering();
         SetWindowTextW(Control(kHintLabelId), L"Nahodne kresleni je aktivni.");
         return true;
     }
@@ -4813,14 +5282,22 @@ private:
     void StopRandomDrawing()
     {
         randomDrawing_ = false;
+        legacyRandomDrawingPausedForMinimize_ = false;
+        if (legacyRandomBatchPending_)
+        {
+            RequestLegacyInteractiveRender();
+        }
+        if (legacyRandomBatchActive_ && !legacyRandomBatchPending_ &&
+            !legacyResizeRebuildActive_)
+        {
+            legacyRandomBatchActive_ = false;
+        }
         KillTimer(mainWindow_, kDrawingTimerId);
         SetWindowTextW(Control(kStartButtonId), L"Start nahodneho kresleni");
         EnableWindow(Control(kIntervalEditId), TRUE);
         EnableWindow(Control(kLineRadioId), TRUE);
         EnableWindow(Control(kCircleRadioId), TRUE);
-        SetWindowTextW(
-            Control(kHintLabelId),
-            L"SDL kruznice jsou aproximovane useckami.");
+        SetWindowTextW(Control(kHintLabelId), L"");
     }
 
     void ShowColorDialog()
@@ -6662,6 +7139,12 @@ float4 PSMain(PSInput input) : SV_TARGET
     ComPtr<ID3D12PipelineState> shaderPipelineState_;
     ComPtr<ID3D12Resource> vertexBuffer_;
     ComPtr<ID3D12Resource> indexBuffer_;
+    std::array<ComPtr<ID3D12Resource>, kFrameCount>
+        legacyBatchVertexBuffers_;
+    std::array<ComPtr<ID3D12Resource>, kFrameCount>
+        legacyBatchIndexBuffers_;
+    std::array<UINT, kFrameCount> legacyBatchVertexCapacities_{};
+    std::array<UINT, kFrameCount> legacyBatchIndexCapacities_{};
     ComPtr<ID3D12Resource> shaderInstanceBuffer_;
     D3D12_VERTEX_BUFFER_VIEW shaderInstanceBufferView_{};
     UINT shaderInstanceBufferCapacityBytes_ = 0;
@@ -6708,6 +7191,14 @@ float4 PSMain(PSInput input) : SV_TARGET
     ULONGLONG lastBatchingModeChangeMs_ = 0;
     bool batchingEnabled_ = false;
     bool hasBatchingModeChanged_ = false;
+    bool legacyRandomBatchActive_ = false;
+    bool legacyRandomBatchPending_ = false;
+    bool legacyRandomBatchScene_ = false;
+    bool legacyResizeRebuildActive_ = false;
+    std::size_t legacyResizeRebuildCursor_ = 0;
+    std::size_t legacyResizeRebuildChunkEnd_ = 0;
+    bool legacyRandomDrawingPausedForMinimize_ = false;
+    bool clearDrawingAfterLegacyRandomBatch_ = false;
     UINT requestedCircleCount_ = kSingleCircleCount;
     ComPtr<ID3D12Fence> fence_;
     HANDLE fenceEvent_ = nullptr;
@@ -6740,6 +7231,7 @@ float4 PSMain(PSInput input) : SV_TARGET
     bool tearingSupported_ = false;
     bool canvasDirty_ = true;
     bool canvasNeedsClear_ = true;
+    bool legacyIdleFramePending_ = true;
     std::size_t canvasRenderedShapeCount_ = 0;
     HWND mainWindow_ = nullptr;
     HWND canvasWindow_ = nullptr;
@@ -7208,6 +7700,15 @@ LRESULT CALLBACK CanvasWindowProc(
 
     auto* app = reinterpret_cast<D3D12App*>(
         GetWindowLongPtrW(window, GWLP_USERDATA));
+    if (app != nullptr && message == WM_PAINT &&
+        app->CanUseLegacyIdleRendering())
+    {
+        PAINTSTRUCT paint{};
+        BeginPaint(window, &paint);
+        app->RequestLegacyInteractiveRender();
+        EndPaint(window, &paint);
+        return 0;
+    }
     if (app != nullptr && message == WM_LBUTTONDOWN)
     {
         app->HandleCanvasClick(
@@ -7489,6 +7990,17 @@ int WINAPI wWinMain(
                 if (IsIconic(window))
                 {
                     app.WaitForWindowMessage();
+                }
+                else if (app.CanUseLegacyIdleRendering())
+                {
+                    if (app.HasLegacyInteractiveRenderPending())
+                    {
+                        app.Render();
+                    }
+                    else
+                    {
+                        app.WaitForLegacyInteractiveWork();
+                    }
                 }
                 else
                 {
