@@ -1,22 +1,44 @@
 # Build outputs
-main.exe
-main.obj
+*.exe
+*.obj
+*.res
+*.spv
+*.pdb
+*.ilk
+/build/
 
-# Benchmark output
-*.log
-*.err
-*.bmp
-*.json
-*.csv
-bench-err.txt
-bench-out.txt
-diagnostics.txt
-legacy-10000.txt
-legacy.txt
-shader-10000.txt
-shader-err.txt
-shader-out.txt
+# Root-level diagnostics and benchmark output
+/*.log
+/*.err
+/*.bmp
+/scaling-results.csv
+/direct2d-10000.json
+/direct2d-test.json
+/legacy-10000.json
+/shader-10000.json
+/shader-test.json
+/shader-test-2.json
+/shader-test-3.json
+/bench-err.txt
+/bench-out.txt
+/debug-freeze.txt
+/diagnostics.txt
+/legacy-10000-err.txt
+/legacy-10000.txt
+/legacy.txt
+/shader-10000-err.txt
+/shader-10000.txt
+/shader-err.txt
+/shader-out.txt
+/test-main-diagnostic-only.txt
+/test-memory-suppressed.txt
+/test-no-diagnostics.txt
+/test-stdout.txt
+/test-stdout-after-fix.txt
+/test-stdout-confirmation.txt
 
-# Local comparison and backup copies
-github-main.cpp
-main-current-working.cpp
+# Local-only settings, comparison utility backups
+/.vscode/launch.json
+/github-main.cpp
+/main-current-working.cpp
+/main - kopie.cpp

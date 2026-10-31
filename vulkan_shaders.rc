@@ -1,0 +1,6 @@
+#include "resource.h"
+
+IDR_VULKAN_CIRCLE_VERT_SPV RCDATA "vulkan_circle.vert.spv"
+IDR_VULKAN_CIRCLE_FRAG_SPV RCDATA "vulkan_circle.frag.spv"
+IDR_VULKAN_CANVAS_VERT_SPV RCDATA "vulkan_canvas.vert.spv"
+IDR_VULKAN_CANVAS_FRAG_SPV RCDATA "vulkan_canvas.frag.spv"

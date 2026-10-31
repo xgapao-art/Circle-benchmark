@@ -37,6 +37,8 @@
 #include <utility>
 #include <vector>
 
+#include "vulkan_renderer.h"
+
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "d3dcompiler.lib")
 #pragma comment(lib, "comctl32.lib")
@@ -105,6 +107,8 @@ constexpr UINT kFastWindowsToDisableBatching = 6;
 constexpr ULONGLONG kBatchingModeMinimumDurationMs = 5000;
 constexpr double kBatchingEnableThreshold = 0.70;
 constexpr double kBatchingDisableThreshold = 1.25;
+constexpr bool kSuppressPeriodicDiagnosticStdoutForTest = false;
+constexpr bool kSuppressLegacyMemoryAndBatchingDiagnosticStdoutForTest = false;
 
 enum class DrawingTimerMode
 {
@@ -117,6 +121,7 @@ enum class RendererMode
     Legacy,
     Shader,
     Direct2D,
+    Vulkan,
 };
 
 enum class GpuSelection
@@ -230,6 +235,7 @@ struct CircleThroughputMetrics
     UINT batchSize = 0;
     UINT64 circlesAddedToScene = 0;
     UINT64 circlesDrawnIntoCanvas = 0;
+    UINT64 vulkanCircleFrameSubmissions = 0;
     UINT64 displayFrames = 0;
     UINT64 canvasUpdates = 0;
     double measurementElapsedMilliseconds = 0.0;
@@ -253,6 +259,7 @@ struct CircleThroughputMetrics
     double d3dFinalFenceDrainMilliseconds = 0.0;
     double circlesAddedPerSecond = 0.0;
     double circlesDrawnIntoCanvasPerSecond = 0.0;
+    double vulkanCircleFrameSubmissionsPerSecond = 0.0;
     double endToEndElapsedMilliseconds = 0.0;
     double circlesAddedEndToEndPerSecond = 0.0;
     double circlesDrawnEndToEndPerSecond = 0.0;
@@ -555,9 +562,22 @@ public:
 
     bool CanUseLegacyIdleRendering() const
     {
-        return CanUseLegacyRandomBatchRendering() &&
+        return (CanUseLegacyRandomBatchRendering() ||
+                CanUseVulkanInteractiveRendering()) &&
             !diagnosticsEnabled_ && !rendererBenchmarkActive_ &&
             !visualCaptureEnabled_;
+    }
+
+    bool CanUseVulkanInteractiveRendering() const
+    {
+        return rendererMode_ == RendererMode::Vulkan &&
+            interactiveLayout_ && requestedCircleCount_ == 0;
+    }
+
+    bool IsVulkanWindowMinimized() const
+    {
+        return rendererMode_ == RendererMode::Vulkan &&
+            mainWindow_ != nullptr && IsIconic(mainWindow_) != FALSE;
     }
 
     bool HasLegacyInteractiveRenderPending() const
@@ -884,7 +904,7 @@ public:
                 ClearDrawing();
                 SetWindowTextW(
                     Control(kHintLabelId),
-                    L"Plátno vymazáno.");
+                    L"Pl\u00E1tno vymaz\u00E1no");
             }
             break;
         case kLineRadioId:
@@ -964,7 +984,9 @@ public:
         {
             return 0;
         }
-        if (minimized_ && CanUseLegacyRandomBatchRendering())
+        if ((minimized_ || IsVulkanWindowMinimized()) &&
+            (CanUseLegacyRandomBatchRendering() ||
+             CanUseVulkanInteractiveRendering()))
         {
             legacyRandomDrawingPausedForMinimize_ = true;
             return 0;
@@ -1100,7 +1122,9 @@ public:
                     hasBatchingModeChanged_ = true;
                     lastBatchingModeChangeMs_ = now;
                     slowWindowCount_ = 0;
-                    if (diagnosticsEnabled_)
+                    if (diagnosticsEnabled_ &&
+                        !(kSuppressPeriodicDiagnosticStdoutForTest &&
+                          rendererMode_ == RendererMode::Legacy))
                     {
                         std::cout << "[diag] adaptive batching enabled\n"
                                   << std::flush;
@@ -1127,7 +1151,9 @@ public:
                     hasBatchingModeChanged_ = true;
                     lastBatchingModeChangeMs_ = now;
                     fastWindowCount_ = 0;
-                    if (diagnosticsEnabled_)
+                    if (diagnosticsEnabled_ &&
+                        !(kSuppressPeriodicDiagnosticStdoutForTest &&
+                          rendererMode_ == RendererMode::Legacy))
                     {
                         std::cout << "[diag] adaptive batching disabled\n"
                                   << std::flush;
@@ -1156,7 +1182,9 @@ public:
         {
             return;
         }
-        if (minimized_ && CanUseLegacyRandomBatchRendering())
+        if ((minimized_ || IsVulkanWindowMinimized()) &&
+            (CanUseLegacyRandomBatchRendering() ||
+             CanUseVulkanInteractiveRendering()))
         {
             legacyRandomDrawingPausedForMinimize_ = true;
             return;
@@ -1214,11 +1242,14 @@ public:
 
     void ResumeLegacyRandomDrawingAfterMinimize()
     {
-        if (!legacyRandomDrawingPausedForMinimize_ || minimized_)
+        if (!legacyRandomDrawingPausedForMinimize_ || minimized_ ||
+            IsVulkanWindowMinimized())
         {
             return;
         }
-        if (!randomDrawing_ || !CanUseLegacyRandomBatchRendering())
+        if (!randomDrawing_ ||
+            (!CanUseLegacyRandomBatchRendering() &&
+             !CanUseVulkanInteractiveRendering()))
         {
             legacyRandomDrawingPausedForMinimize_ = false;
             return;
@@ -1444,7 +1475,13 @@ public:
         if (width == 0 || height == 0)
         {
             minimized_ = true;
-            if (randomDrawing_ && CanUseLegacyRandomBatchRendering())
+            if (rendererMode_ == RendererMode::Vulkan &&
+                vulkanInitialized_)
+            {
+                vulkanRenderer_.Resize(0, 0);
+            }
+            if (randomDrawing_ && (CanUseLegacyRandomBatchRendering() ||
+                                   CanUseVulkanInteractiveRendering()))
             {
                 legacyRandomDrawingPausedForMinimize_ = true;
             }
@@ -1530,7 +1567,36 @@ public:
                 circleThroughputScenePreparationTicks_ = preparationTicks;
             }
         }
-        if (rendererMode_ == RendererMode::Direct2D)
+        if (rendererMode_ == RendererMode::Vulkan)
+        {
+            BuildVulkanScene();
+            vulkanRenderer_.SetClearColor(
+                interactiveLayout_ ? 1.0f : 0.08f,
+                interactiveLayout_ ? 1.0f : 0.30f,
+                interactiveLayout_ ? 1.0f : 0.72f);
+            const VulkanGpuSelection selection =
+                gpuSelection_ == GpuSelection::Integrated
+                    ? VulkanGpuSelection::Integrated
+                    : gpuSelection_ == GpuSelection::Discrete
+                        ? VulkanGpuSelection::Discrete
+                        : VulkanGpuSelection::Auto;
+            vulkanPersistentCanvas_ =
+                interactiveLayout_ && requestedCircleCount_ == 0;
+            vulkanRenderer_.Initialize(
+                window_, width_, height_, selection,
+                vulkanPersistentCanvas_);
+            vulkanInitialized_ = true;
+            if (vulkanPersistentCanvas_)
+            {
+                RebuildInteractiveGeometry();
+            }
+            else
+            {
+                vulkanRenderer_.SetVertices(vulkanVertices_);
+            }
+            UpdateRendererLabel();
+        }
+        else if (rendererMode_ == RendererMode::Direct2D)
         {
             CreateDirect2DResources();
         }
@@ -1581,7 +1647,9 @@ public:
             }
         }
 
-        std::wstring title = kWindowTitle;
+        std::wstring title = rendererMode_ == RendererMode::Vulkan
+            ? L"Kresleni - benchmark Vulkan"
+            : kWindowTitle;
         if (requestedCircleCount_ != 0)
         {
             title += L" - ";
@@ -1629,7 +1697,7 @@ public:
 
     void Render()
     {
-        if (minimized_)
+        if (minimized_ || IsVulkanWindowMinimized())
         {
             return;
         }
@@ -1637,6 +1705,11 @@ public:
         if (resizePending_)
         {
             ApplyResize();
+        }
+        if (rendererMode_ == RendererMode::Vulkan)
+        {
+            RenderVulkanFrame();
+            return;
         }
         if (rendererMode_ == RendererMode::Direct2D)
         {
@@ -1869,36 +1942,51 @@ public:
             static_cast<double>(diagnosticFrequency_.QuadPart);
         const double frameCount = static_cast<double>(diagnosticFrameCount_);
         const double objectCount = static_cast<double>(diagnosticObjectCount_);
-        std::cout << std::fixed << std::setprecision(2)
-                  << "[diag] Present returns/s="
-                  << frameCount / elapsedSeconds
-                  << ", objects added/s=" << objectCount / elapsedSeconds
-                  << ", add CPU ms/object="
-                  << (diagnosticObjectCount_ == 0
-                          ? 0.0
-                          : static_cast<double>(diagnosticAddTicks_) *
-                                ticksToMs / objectCount)
-                  << ", frame fence wait ms/frame="
-                  << (frameCount == 0.0
-                          ? 0.0
-                          : static_cast<double>(diagnosticFenceWaitTicks_) *
-                                ticksToMs / frameCount)
-                  << ", record+execute ms/frame="
-                  << (frameCount == 0.0
-                          ? 0.0
-                          : static_cast<double>(diagnosticRecordTicks_) *
-                                ticksToMs / frameCount)
-                  << ", Present CPU ms/call="
-                  << (frameCount == 0.0
-                          ? 0.0
-                          : static_cast<double>(diagnosticPresentTicks_) *
-                                ticksToMs / frameCount)
-                  << ", fence signal ms/frame="
-                  << (frameCount == 0.0
-                          ? 0.0
-                          : static_cast<double>(diagnosticSignalTicks_) *
-                                ticksToMs / frameCount)
-                  << '\n' << std::flush;
+        const double presentReturnsPerSecond = frameCount / elapsedSeconds;
+        const double objectsAddedPerSecond = objectCount / elapsedSeconds;
+        const double addCpuMsPerObject =
+            diagnosticObjectCount_ == 0
+                ? 0.0
+                : static_cast<double>(diagnosticAddTicks_) *
+                      ticksToMs / objectCount;
+        const double frameFenceWaitMsPerFrame =
+            frameCount == 0.0
+                ? 0.0
+                : static_cast<double>(diagnosticFenceWaitTicks_) *
+                      ticksToMs / frameCount;
+        const double recordExecuteMsPerFrame =
+            frameCount == 0.0
+                ? 0.0
+                : static_cast<double>(diagnosticRecordTicks_) *
+                      ticksToMs / frameCount;
+        const double presentCpuMsPerCall =
+            frameCount == 0.0
+                ? 0.0
+                : static_cast<double>(diagnosticPresentTicks_) *
+                      ticksToMs / frameCount;
+        const double fenceSignalMsPerFrame =
+            frameCount == 0.0
+                ? 0.0
+                : static_cast<double>(diagnosticSignalTicks_) *
+                      ticksToMs / frameCount;
+        const bool writePeriodicDiagnosticStdout =
+            !(kSuppressPeriodicDiagnosticStdoutForTest &&
+              rendererMode_ == RendererMode::Legacy);
+        if (writePeriodicDiagnosticStdout)
+        {
+            std::cout << std::fixed << std::setprecision(2);
+            std::cout << "[diag] Present returns/s="
+                      << presentReturnsPerSecond
+                      << ", objects added/s=" << objectsAddedPerSecond
+                      << ", add CPU ms/object=" << addCpuMsPerObject
+                      << ", frame fence wait ms/frame="
+                      << frameFenceWaitMsPerFrame
+                      << ", record+execute ms/frame="
+                      << recordExecuteMsPerFrame
+                      << ", Present CPU ms/call=" << presentCpuMsPerCall
+                      << ", fence signal ms/frame=" << fenceSignalMsPerFrame
+                      << '\n';
+        }
         if (rendererMode_ == RendererMode::Legacy)
         {
             PrintLegacyMemoryDiagnostics();
@@ -2099,7 +2187,19 @@ public:
             nextShape += batchCount;
         }
 
-        if (rendererMode_ != RendererMode::Direct2D)
+        if (rendererMode_ == RendererMode::Vulkan)
+        {
+            WaitForGpu();
+            if (canvasRenderedShapeCount_ != circleThroughputTargetCount_ ||
+                circleThroughputMetrics_.circlesDrawnIntoCanvas !=
+                    circleThroughputTargetCount_)
+            {
+                circleThroughputBenchmarkActive_ = false;
+                throw std::runtime_error(
+                    "Vulkan did not present every throughput circle before its queue drain");
+            }
+        }
+        else if (rendererMode_ != RendererMode::Direct2D)
         {
             LARGE_INTEGER drainStart{};
             LARGE_INTEGER drainStop{};
@@ -2204,6 +2304,14 @@ public:
             static_cast<double>(
                 circleThroughputMetrics_.circlesDrawnIntoCanvas) * 1000.0 /
             circleThroughputMetrics_.measurementElapsedMilliseconds;
+        if (rendererMode_ == RendererMode::Vulkan)
+        {
+            circleThroughputMetrics_.vulkanCircleFrameSubmissionsPerSecond =
+                static_cast<double>(
+                    circleThroughputMetrics_.vulkanCircleFrameSubmissions) *
+                1000.0 /
+                circleThroughputMetrics_.measurementElapsedMilliseconds;
+        }
         circleThroughputMetrics_.canvasCompletionElapsedMilliseconds =
             circleThroughputMetrics_.measurementElapsedMilliseconds;
         circleThroughputMetrics_.endToEndElapsedMilliseconds =
@@ -2237,8 +2345,16 @@ public:
                   << " drawn_into_canvas_per_second="
                   << circleThroughputMetrics_.circlesDrawnIntoCanvasPerSecond
                   << " end_to_end_added_per_second="
-                  << circleThroughputMetrics_.circlesAddedEndToEndPerSecond
-                  << " gpu_draw_ms=";
+                  << circleThroughputMetrics_.circlesAddedEndToEndPerSecond;
+        if (rendererMode_ == RendererMode::Vulkan)
+        {
+            std::cout << " vulkan_circle_frame_submissions="
+                      << circleThroughputMetrics_.vulkanCircleFrameSubmissions
+                      << " vulkan_circle_frame_submissions_per_second="
+                      << circleThroughputMetrics_
+                             .vulkanCircleFrameSubmissionsPerSecond;
+        }
+        std::cout << " gpu_draw_ms=";
         if (circleThroughputMetrics_.gpuDrawTimeAvailable)
         {
             std::cout << circleThroughputMetrics_.d3dGpuDrawMilliseconds;
@@ -2253,6 +2369,17 @@ public:
 
     void RunRendererBenchmark(UINT measurementMilliseconds, bool gpuBenchmark)
     {
+        if (rendererMode_ == RendererMode::Vulkan)
+        {
+            if (gpuBenchmark)
+            {
+                throw std::runtime_error(
+                    "Vulkan GPU timestamp benchmarking is unavailable; "
+                    "use --render-benchmark for CPU-side presented-frame timing.");
+            }
+            RunVulkanRendererBenchmark(measurementMilliseconds);
+            return;
+        }
         if (rendererMode_ == RendererMode::Direct2D)
         {
             if (gpuBenchmark)
@@ -2606,6 +2733,180 @@ public:
         }
     }
 
+    void RunVulkanRendererBenchmark(UINT measurementMilliseconds)
+    {
+        LARGE_INTEGER frequency{};
+        if (!QueryPerformanceFrequency(&frequency) || frequency.QuadPart <= 0)
+        {
+            throw std::runtime_error(
+                "QueryPerformanceFrequency failed for Vulkan renderer benchmark");
+        }
+        if (circleParameters_.size() != requestedCircleCount_)
+        {
+            throw std::runtime_error(
+                "Vulkan renderer benchmark scene count does not match the requested count");
+        }
+
+        const std::uint64_t sceneHash = HashCircleScene(circleParameters_);
+        std::cout << "Presented renderer benchmark\n"
+                  << "Renderer: Vulkan\n"
+                  << "Graphics API: Vulkan\n"
+                  << "GPU adapter: " << vulkanRenderer_.DeviceName()
+                  << " (vendor_id=0x" << std::hex << std::uppercase
+                  << vulkanRenderer_.VendorId() << ", device_id=0x"
+                  << vulkanRenderer_.DeviceId() << std::dec
+                  << std::nouppercase << ")\n"
+                  << "Circles: " << circleParameters_.size() << '\n'
+                  << "Client size: " << width_ << 'x' << height_ << '\n'
+                  << "Warm-up: 3000 ms; measured: "
+                  << measurementMilliseconds << " ms\n"
+                  << "Scene seed: " << kSeed << "; scene hash: 0x"
+                  << std::hex << std::uppercase << sceneHash << std::dec
+                  << std::nouppercase << '\n'
+                  << "Frame timing is CPU elapsed time through Vulkan command "
+                     "submission and Present; GPU execution time is unavailable.\n";
+
+        LARGE_INTEGER now{};
+        if (!QueryPerformanceCounter(&now))
+        {
+            throw std::runtime_error(
+                "QueryPerformanceCounter failed before Vulkan benchmark warm-up");
+        }
+        const LONGLONG warmupEnd =
+            now.QuadPart + frequency.QuadPart * 3;
+        while (now.QuadPart < warmupEnd)
+        {
+            Render();
+            if (!QueryPerformanceCounter(&now))
+            {
+                throw std::runtime_error(
+                    "QueryPerformanceCounter failed during Vulkan benchmark warm-up");
+            }
+        }
+        WaitForGpu();
+
+        rendererBenchmarkFrameSamples_.clear();
+        rendererBenchmarkFrameSamples_.reserve(65536);
+        rendererBenchmarkPresentReturns_ = 0;
+        rendererBenchmarkDrawCalls_ = 0;
+        rendererBenchmarkRenderedCircles_ = 0;
+        if (!QueryPerformanceCounter(&rendererBenchmarkMeasurementStart_))
+        {
+            throw std::runtime_error(
+                "QueryPerformanceCounter failed at Vulkan benchmark start");
+        }
+        rendererBenchmarkMeasurementEnd_.QuadPart =
+            rendererBenchmarkMeasurementStart_.QuadPart +
+            frequency.QuadPart * measurementMilliseconds / 1000;
+        rendererBenchmarkActive_ = true;
+        now = rendererBenchmarkMeasurementStart_;
+        while (now.QuadPart < rendererBenchmarkMeasurementEnd_.QuadPart)
+        {
+            Render();
+            if (!QueryPerformanceCounter(&now))
+            {
+                rendererBenchmarkActive_ = false;
+                throw std::runtime_error(
+                    "QueryPerformanceCounter failed during Vulkan benchmark");
+            }
+        }
+        rendererBenchmarkActive_ = false;
+        WaitForGpu();
+        if (rendererBenchmarkFrameSamples_.empty() ||
+            rendererBenchmarkPresentReturns_ !=
+                rendererBenchmarkFrameSamples_.size())
+        {
+            throw std::runtime_error(
+                "Vulkan renderer benchmark did not collect presented frames");
+        }
+
+        std::vector<double> frameElapsedMilliseconds;
+        frameElapsedMilliseconds.reserve(
+            rendererBenchmarkFrameSamples_.size());
+        for (const RendererFrameSample& sample : rendererBenchmarkFrameSamples_)
+        {
+            frameElapsedMilliseconds.push_back(
+                static_cast<double>(sample.recordElapsedTicks) * 1000.0 /
+                static_cast<double>(frequency.QuadPart));
+        }
+        const SampleSummary frameElapsed =
+            SummarizeSamples(frameElapsedMilliseconds);
+        std::sort(
+            frameElapsedMilliseconds.begin(),
+            frameElapsedMilliseconds.end());
+        const std::size_t p95Index = std::min(
+            frameElapsedMilliseconds.size() - 1,
+            static_cast<std::size_t>(std::ceil(
+                0.95 * static_cast<double>(
+                           frameElapsedMilliseconds.size()))) - 1);
+        const double frameP95 = frameElapsedMilliseconds[p95Index];
+        const double measuredSeconds =
+            static_cast<double>(measurementMilliseconds) / 1000.0;
+        const double framesPerSecond =
+            static_cast<double>(rendererBenchmarkFrameSamples_.size()) /
+            measuredSeconds;
+        std::cout << std::fixed << std::setprecision(3)
+                  << "[renderer-benchmark] result renderer=vulkan"
+                  << " api=Vulkan target_type=Vulkan_swap_chain"
+                  << " gpu_adapter=\"" << vulkanRenderer_.DeviceName() << '"'
+                  << " gpu_time=unavailable"
+                  << " size=" << width_ << 'x' << height_
+                  << " circles=" << requestedCircleCount_
+                  << " seed=" << kSeed
+                  << " scene_hash=0x" << std::hex << std::uppercase << sceneHash
+                  << std::dec << std::nouppercase
+                  << " measured_ms=" << measurementMilliseconds
+                  << " completed_frames="
+                  << rendererBenchmarkFrameSamples_.size()
+                  << " frames_per_s=" << framesPerSecond
+                  << " frame_cpu_elapsed_ms_per_frame_mean="
+                  << frameElapsed.mean
+                  << " frame_cpu_elapsed_ms_per_frame_median="
+                  << frameElapsed.median
+                  << " frame_cpu_elapsed_ms_per_frame_p95="
+                  << frameP95
+                  << " draw_calls_per_frame="
+                  << static_cast<double>(rendererBenchmarkDrawCalls_) /
+                         static_cast<double>(
+                             rendererBenchmarkFrameSamples_.size())
+                  << " rendered_circle_submissions="
+                  << rendererBenchmarkRenderedCircles_
+                  << '\n';
+
+        std::ostringstream json;
+        json << std::setprecision(10)
+             << "{\n"
+             << "  \"status\": \"success\",\n"
+             << "  \"exit_code\": 0,\n"
+             << "  \"renderer\": \"vulkan\",\n"
+             << "  \"api\": \"Vulkan\",\n"
+             << "  \"target_type\": \"Vulkan_swap_chain\",\n"
+             << "  \"circle_count\": " << requestedCircleCount_ << ",\n"
+             << "  \"seed\": " << kSeed << ",\n"
+             << "  \"scene_hash\": \"0x" << std::hex << std::uppercase
+             << sceneHash << std::dec << std::nouppercase << "\",\n"
+             << "  \"measurement_ms\": " << measurementMilliseconds << ",\n"
+             << "  \"completed_frames\": "
+             << rendererBenchmarkFrameSamples_.size() << ",\n"
+             << "  \"frames_per_s\": " << framesPerSecond << ",\n"
+             << "  \"frame_cpu_elapsed_ms_per_frame_mean\": "
+             << frameElapsed.mean << ",\n"
+             << "  \"frame_cpu_elapsed_ms_per_frame_median\": "
+             << frameElapsed.median << ",\n"
+             << "  \"frame_cpu_elapsed_ms_per_frame_p95\": "
+             << frameP95 << ",\n"
+             << "  \"draw_calls_per_frame\": "
+             << static_cast<double>(rendererBenchmarkDrawCalls_) /
+                    static_cast<double>(
+                        rendererBenchmarkFrameSamples_.size()) << ",\n"
+             << "  \"rendered_circle_submissions\": "
+             << rendererBenchmarkRenderedCircles_ << ",\n"
+             << "  \"gpu_time_available\": false,\n"
+             << "  \"gpu_execution_ms_per_frame\": null\n"
+             << "}\n";
+        benchmarkOutputJson_ = json.str();
+    }
+
     void RunDirect2DBenchmark(UINT measurementMilliseconds)
     {
         LARGE_INTEGER frequency{};
@@ -2848,6 +3149,11 @@ public:
 
     void WaitForGpu()
     {
+        if (rendererMode_ == RendererMode::Vulkan)
+        {
+            vulkanRenderer_.WaitIdle();
+            return;
+        }
         if (!commandQueue_ || !fence_)
         {
             return;
@@ -2866,6 +3172,11 @@ public:
 
     void Shutdown()
     {
+        if (vulkanInitialized_)
+        {
+            vulkanRenderer_.Shutdown();
+            vulkanInitialized_ = false;
+        }
         if (commandsSubmitted_ && commandQueue_ && fence_)
         {
             WaitForGpu();
@@ -2936,6 +3247,8 @@ private:
             return;
         }
         const bool direct2D = rendererMode_ == RendererMode::Direct2D;
+        const bool vulkan = rendererMode_ == RendererMode::Vulkan;
+        const bool d3d12 = !direct2D && !vulkan;
         const CircleThroughputMetrics& metrics = circleThroughputMetrics_;
         const auto validateMetric = [](double value, const char* name) {
             if (!std::isfinite(value))
@@ -2953,6 +3266,9 @@ private:
         validateMetric(
             metrics.circlesDrawnIntoCanvasPerSecond,
             "circles_drawn_into_canvas_per_second");
+        validateMetric(
+            metrics.vulkanCircleFrameSubmissionsPerSecond,
+            "vulkan_circle_frame_submissions_per_second");
         validateMetric(
             metrics.endToEndElapsedMilliseconds,
             "end_to_end_including_preparation_elapsed_ms");
@@ -2990,7 +3306,11 @@ private:
              << "  \"exit_code\": 0,\n"
              << "  \"renderer\": \"" << RendererModeName(rendererMode_) << "\",\n"
              << "  \"target_type\": \""
-             << (direct2D ? "ID2D1HwndRenderTarget" : "D3D12_persistent_canvas")
+             << (direct2D
+                     ? "ID2D1HwndRenderTarget"
+                     : rendererMode_ == RendererMode::Vulkan
+                         ? "Vulkan_swap_chain"
+                         : "D3D12_persistent_canvas")
              << "\",\n"
              << "  \"hardware_acceleration\": \""
              << (direct2D ? "unknown" : "yes") << "\",\n"
@@ -3012,6 +3332,26 @@ private:
              << metrics.circlesAddedPerSecond << ",\n"
              << "  \"circles_drawn_into_canvas_per_second\": "
              << metrics.circlesDrawnIntoCanvasPerSecond << ",\n"
+             << "  \"vulkan_circle_frame_submissions\": ";
+        if (vulkan)
+        {
+            json << metrics.vulkanCircleFrameSubmissions;
+        }
+        else
+        {
+            json << "null";
+        }
+        json << ",\n"
+             << "  \"vulkan_circle_frame_submissions_per_second\": ";
+        if (vulkan)
+        {
+            json << metrics.vulkanCircleFrameSubmissionsPerSecond;
+        }
+        else
+        {
+            json << "null";
+        }
+        json << ",\n"
              << "  \"scene_data_preparation_included_in_throughput_elapsed\": false,\n"
              << "  \"end_to_end_including_preparation_elapsed_ms\": "
              << metrics.endToEndElapsedMilliseconds << ",\n"
@@ -3024,7 +3364,9 @@ private:
              << "  \"measurement_scope\": \""
              << (direct2D
                      ? "batch insertion through successful Direct2D EndDraw and display; asynchronous GPU completion is unknown; scene preparation and renderer initialization excluded"
-                     : "batch insertion through completed display and final D3D12 fence drain; scene preparation and renderer initialization excluded")
+                     : vulkan
+                         ? "batch insertion through successful Vulkan presentation and final Vulkan queue idle; scene preparation and renderer initialization excluded"
+                         : "batch insertion through completed display and final D3D12 fence drain; scene preparation and renderer initialization excluded")
              << "\",\n"
              << "  \"end_to_end_scope\": \"scene data preparation plus measurement scope; renderer initialization excluded\",\n"
              << "  \"scene_addition_elapsed_ms\": "
@@ -3034,7 +3376,9 @@ private:
              << "  \"canvas_completion_semantics\": \""
              << (direct2D
                      ? "successful Direct2D bitmap EndDraw; asynchronous GPU completion is unknown"
-                     : "D3D12 submission confirmed complete by fence")
+                     : vulkan
+                         ? "successful Vulkan presentation with final queue idle"
+                         : "D3D12 submission confirmed complete by fence")
              << "\",\n"
              << "  \"canvas_update_elapsed_ms\": ";
         if (direct2D)
@@ -3067,7 +3411,9 @@ private:
              << "  \"cpu_time_estimation\": \""
              << (direct2D
                      ? "Direct2D CPU estimates calibrate QueryThreadCycleTime against thread CPU time over the full measurement; they are not GPU time"
-                     : "D3D12 stage timings are QPC elapsed times; GPU draw timing is reported separately")
+                     : vulkan
+                         ? "Vulkan geometry staging and frame submission timings are CPU-side QPC elapsed times; GPU execution time is unavailable"
+                         : "D3D12 stage timings are QPC elapsed times; GPU draw timing is reported separately")
              << "\",\n"
              << "  \"renderer_geometry_preparation_elapsed_ms\": ";
         writeOptionalMetric(
@@ -3079,11 +3425,11 @@ private:
         json << ",\n"
              << "  \"renderer_command_record_elapsed_ms\": ";
         writeOptionalMetric(
-            !direct2D, metrics.rendererCommandRecordMilliseconds);
+            d3d12, metrics.rendererCommandRecordMilliseconds);
         json << ",\n"
              << "  \"renderer_command_execute_api_elapsed_ms\": ";
         writeOptionalMetric(
-            !direct2D, metrics.rendererCommandExecuteMilliseconds);
+            d3d12, metrics.rendererCommandExecuteMilliseconds);
         json << ",\n"
              << "  \"gpu_draw_time_available\": "
              << (metrics.gpuDrawTimeAvailable ? "true" : "false") << ",\n"
@@ -3102,7 +3448,9 @@ private:
                      ? "D3D12 timestamp queries around canvas draw commands"
                      : (direct2D
                             ? "unavailable; Direct2D EndDraw is not GPU completion"
-                            : "unavailable; D3D12 timestamp queries were unavailable or invalid"))
+                            : vulkan
+                                ? "unavailable; Vulkan GPU timestamp queries are not enabled"
+                                : "unavailable; D3D12 timestamp queries were unavailable or invalid"))
              << "\",\n"
              << "  \"bitmap_blit_issue_ms\": ";
         writeOptionalMetric(
@@ -3113,15 +3461,15 @@ private:
         json << ",\n"
              << "  \"d3d12_present_api_ms\": ";
         writeOptionalMetric(
-            !direct2D, metrics.d3dPresentApiMilliseconds);
+            d3d12, metrics.d3dPresentApiMilliseconds);
         json << ",\n"
              << "  \"d3d12_wait_for_frame_elapsed_ms\": ";
         writeOptionalMetric(
-            !direct2D, metrics.d3dFrameFenceWaitMilliseconds);
+            d3d12, metrics.d3dFrameFenceWaitMilliseconds);
         json << ",\n"
              << "  \"d3d12_final_fence_drain_ms\": ";
         writeOptionalMetric(
-            !direct2D, metrics.d3dFinalFenceDrainMilliseconds);
+            d3d12, metrics.d3dFinalFenceDrainMilliseconds);
         json << "\n}\n";
         benchmarkOutputJson_ = json.str();
     }
@@ -3681,6 +4029,21 @@ private:
             return;
         }
 
+        if (rendererMode_ == RendererMode::Vulkan)
+        {
+            std::cout << " api=Vulkan target_type=Vulkan_swap_chain"
+                      << " hardware_acceleration=yes"
+                      << " gpu_adapter=\"" << vulkanRenderer_.DeviceName()
+                      << "\" vendor_id=0x" << std::hex << std::uppercase
+                      << vulkanRenderer_.VendorId()
+                      << " device_id=0x" << vulkanRenderer_.DeviceId()
+                      << std::dec << std::nouppercase
+                      << " gpu_selection=" << GpuSelectionLabel(gpuSelection_)
+                      << " adapter_selection_status=verified\n"
+                      << std::flush;
+            return;
+        }
+
         std::cout << " target_type=D3D12_swap_chain"
                   << " hardware_acceleration=yes gpu_selection="
                   << GpuSelectionLabel(gpuSelection_)
@@ -3689,6 +4052,8 @@ private:
 
     void PrintLegacyMemoryDiagnostics()
     {
+        const bool writePeriodicDiagnosticStdout =
+            !kSuppressLegacyMemoryAndBatchingDiagnosticStdoutForTest;
         const auto byteCount = [](std::size_t count, std::size_t elementSize,
                                   std::size_t& bytes) {
             if (elementSize != 0 &&
@@ -3699,32 +4064,40 @@ private:
             bytes = count * elementSize;
             return true;
         };
-        const auto printVectorBytes = [&byteCount](
+        const auto printVectorBytes = [&byteCount, &writePeriodicDiagnosticStdout](
                                           const char* name,
                                           std::size_t size,
                                           std::size_t capacity,
                                           std::size_t elementSize) {
             std::size_t sizeBytes = 0;
             std::size_t capacityBytes = 0;
-            std::cout << "[diag][legacy-memory] " << name << "_size_bytes=";
-            if (byteCount(size, elementSize, sizeBytes))
+            const bool sizeAvailable =
+                byteCount(size, elementSize, sizeBytes);
+            const bool capacityAvailable =
+                byteCount(capacity, elementSize, capacityBytes);
+            if (writePeriodicDiagnosticStdout)
             {
-                std::cout << sizeBytes;
+                std::cout << "[diag][legacy-memory] " << name
+                          << "_size_bytes=";
+                if (sizeAvailable)
+                {
+                    std::cout << sizeBytes;
+                }
+                else
+                {
+                    std::cout << "unavailable(overflow)";
+                }
+                std::cout << ' ' << name << "_capacity_bytes=";
+                if (capacityAvailable)
+                {
+                    std::cout << capacityBytes;
+                }
+                else
+                {
+                    std::cout << "unavailable(overflow)";
+                }
+                std::cout << '\n';
             }
-            else
-            {
-                std::cout << "unavailable(overflow)";
-            }
-            std::cout << ' ' << name << "_capacity_bytes=";
-            if (byteCount(capacity, elementSize, capacityBytes))
-            {
-                std::cout << capacityBytes;
-            }
-            else
-            {
-                std::cout << "unavailable(overflow)";
-            }
-            std::cout << '\n';
         };
 
         printVectorBytes("vertices", vertices_.size(), vertices_.capacity(),
@@ -3738,25 +4111,28 @@ private:
         printVectorBytes("shapeCircleInstanceIndices",
                          shapeCircleInstanceIndices_.size(),
                          shapeCircleInstanceIndices_.capacity(), sizeof(UINT));
-        std::cout << "[diag][legacy-memory] current_vertex_buffer_capacity_bytes=";
-        if (vertexBuffer_)
+        if (writePeriodicDiagnosticStdout)
         {
-            std::cout << vertexBufferCapacityBytes_;
+            std::cout << "[diag][legacy-memory] current_vertex_buffer_capacity_bytes=";
+            if (vertexBuffer_)
+            {
+                std::cout << vertexBufferCapacityBytes_;
+            }
+            else
+            {
+                std::cout << "unavailable(no buffer)";
+            }
+            std::cout << " current_index_buffer_capacity_bytes=";
+            if (indexBuffer_)
+            {
+                std::cout << indexBufferCapacityBytes_;
+            }
+            else
+            {
+                std::cout << "unavailable(no buffer)";
+            }
+            std::cout << '\n';
         }
-        else
-        {
-            std::cout << "unavailable(no buffer)";
-        }
-        std::cout << " current_index_buffer_capacity_bytes=";
-        if (indexBuffer_)
-        {
-            std::cout << indexBufferCapacityBytes_;
-        }
-        else
-        {
-            std::cout << "unavailable(no buffer)";
-        }
-        std::cout << '\n';
 
         UINT64 retiredVertexBytes = 0;
         UINT64 retiredIndexBytes = 0;
@@ -3785,27 +4161,30 @@ private:
                 retiredIndexBytesAvailable = false;
             }
         }
-        std::cout << "[diag][legacy-memory] retired_buffer_entries="
-                  << retiredGeometryBuffers_.size()
-                  << " retired_vertex_capacity_bytes=";
-        if (retiredVertexBytesAvailable)
+        if (writePeriodicDiagnosticStdout)
         {
-            std::cout << retiredVertexBytes;
+            std::cout << "[diag][legacy-memory] retired_buffer_entries="
+                      << retiredGeometryBuffers_.size()
+                      << " retired_vertex_capacity_bytes=";
+            if (retiredVertexBytesAvailable)
+            {
+                std::cout << retiredVertexBytes;
+            }
+            else
+            {
+                std::cout << "unavailable(overflow)";
+            }
+            std::cout << " retired_index_capacity_bytes=";
+            if (retiredIndexBytesAvailable)
+            {
+                std::cout << retiredIndexBytes;
+            }
+            else
+            {
+                std::cout << "unavailable(overflow)";
+            }
+            std::cout << '\n';
         }
-        else
-        {
-            std::cout << "unavailable(overflow)";
-        }
-        std::cout << " retired_index_capacity_bytes=";
-        if (retiredIndexBytesAvailable)
-        {
-            std::cout << retiredIndexBytes;
-        }
-        else
-        {
-            std::cout << "unavailable(overflow)";
-        }
-        std::cout << '\n';
 
         PROCESS_MEMORY_COUNTERS_EX memory{};
         memory.cb = sizeof(memory);
@@ -3814,16 +4193,140 @@ private:
                 reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&memory),
                 sizeof(memory)))
         {
-            std::cout << "[diag][legacy-memory] process_private_usage_bytes="
-                      << memory.PrivateUsage << '\n';
+            if (writePeriodicDiagnosticStdout)
+            {
+                std::cout << "[diag][legacy-memory] process_private_usage_bytes="
+                          << memory.PrivateUsage << '\n';
+            }
         }
         else
         {
-            std::cout << "[diag][legacy-memory] process_private_usage_bytes="
-                         "unavailable(GetProcessMemoryInfo error "
-                      << GetLastError() << ")\n";
+            const DWORD error = GetLastError();
+            if (writePeriodicDiagnosticStdout)
+            {
+                std::cout << "[diag][legacy-memory] process_private_usage_bytes="
+                             "unavailable(GetProcessMemoryInfo error "
+                          << error << ")\n";
+            }
         }
-        std::cout << std::flush;
+    }
+
+    void RenderVulkanFrame()
+    {
+        const bool measure = rendererBenchmarkActive_ ||
+            diagnosticsEnabled_ || circleThroughputBenchmarkActive_;
+        LARGE_INTEGER frameStart{};
+        if (measure && !QueryPerformanceCounter(&frameStart))
+        {
+            throw std::runtime_error(
+                "QueryPerformanceCounter failed before Vulkan frame");
+        }
+        const VulkanFrameResult frameResult = vulkanRenderer_.Render();
+        if (frameResult == VulkanFrameResult::NotSubmitted)
+        {
+            if (vulkanPersistentCanvas_ &&
+                vulkanRenderer_.CanvasRebuildRequired())
+            {
+                RebuildInteractiveGeometry();
+            }
+            return;
+        }
+        LARGE_INTEGER frameStop{};
+        if (measure && !QueryPerformanceCounter(&frameStop))
+        {
+            throw std::runtime_error(
+                "QueryPerformanceCounter failed after Vulkan frame");
+        }
+
+        const bool canvasGeometrySubmitted =
+            vulkanRenderer_.LastFrameCanvasGeometrySubmitted();
+        lastFrameDrawCallCount_ = vulkanPersistentCanvas_
+            ? 1U + static_cast<UINT>(canvasGeometrySubmitted)
+            : vulkanVertices_.empty() ? 0U : 1U;
+        lastFrameRenderedCircleCount_ = 0;
+        if (vulkanPersistentCanvas_)
+        {
+            lastFrameRenderedCircleCount_ = canvasGeometrySubmitted
+                ? static_cast<UINT>(pendingVulkanCanvasCircles_)
+                : 0U;
+        }
+        else if (interactiveLayout_ && requestedCircleCount_ == 0)
+        {
+            lastFrameRenderedCircleCount_ = static_cast<UINT>(
+                std::count_if(
+                    drawingShapes_.begin(), drawingShapes_.end(),
+                    [](const DrawingShape& shape) { return shape.circle; }));
+        }
+        else
+        {
+            lastFrameRenderedCircleCount_ =
+                static_cast<UINT>(circleParameters_.size());
+        }
+
+        if (circleThroughputBenchmarkActive_)
+        {
+            circleThroughputMetrics_.vulkanCircleFrameSubmissions +=
+                vulkanPersistentCanvas_
+                    ? (canvasGeometrySubmitted
+                        ? pendingVulkanCanvasCircles_
+                        : 0U)
+                    : lastFrameRenderedCircleCount_;
+        }
+        if (vulkanPersistentCanvas_ && canvasGeometrySubmitted)
+        {
+            pendingVulkanCanvasCircles_ = 0;
+        }
+        if (frameResult == VulkanFrameResult::Submitted)
+        {
+            return;
+        }
+        if (frameResult != VulkanFrameResult::Presented)
+        {
+            return;
+        }
+        if (vulkanPersistentCanvas_)
+        {
+            canvasRenderedShapeCount_ = drawingShapes_.size();
+        }
+
+        if (rendererBenchmarkActive_ &&
+            frameStop.QuadPart < rendererBenchmarkMeasurementEnd_.QuadPart)
+        {
+            RendererFrameSample sample;
+            sample.recordElapsedTicks = static_cast<UINT64>(
+                frameStop.QuadPart - frameStart.QuadPart);
+            sample.drawCalls = lastFrameDrawCallCount_;
+            sample.renderedCircles = lastFrameRenderedCircleCount_;
+            rendererBenchmarkFrameSamples_.push_back(sample);
+            ++rendererBenchmarkPresentReturns_;
+            rendererBenchmarkDrawCalls_ += lastFrameDrawCallCount_;
+            rendererBenchmarkRenderedCircles_ +=
+                lastFrameRenderedCircleCount_;
+        }
+        if (circleThroughputBenchmarkActive_)
+        {
+            ++circleThroughputMetrics_.displayFrames;
+            ++circleThroughputMetrics_.canvasUpdates;
+            circleThroughputMetrics_.circlesDrawnIntoCanvas +=
+                pendingGeneratedShapesForPresent_;
+        }
+        if (diagnosticsEnabled_)
+        {
+            ++diagnosticFrameCount_;
+            diagnosticRecordTicks_ += static_cast<UINT64>(
+                frameStop.QuadPart - frameStart.QuadPart);
+            ReportDiagnosticsIfDue();
+        }
+
+        legacyIdleFramePending_ = false;
+        canvasDirty_ = false;
+        canvasNeedsClear_ = false;
+        if (interactiveLayout_)
+        {
+            renderedInSpeedWindow_ += pendingGeneratedShapesForPresent_;
+            pendingGeneratedShapesForPresent_ = 0;
+            UpdateDrawingRateWindow();
+        }
     }
 
     void RenderDirect2DFrame()
@@ -4134,6 +4637,7 @@ private:
         case RendererMode::Legacy: return "legacy";
         case RendererMode::Shader: return "shader";
         case RendererMode::Direct2D: return "direct2d";
+        case RendererMode::Vulkan: return "vulkan";
         }
         return "unknown";
     }
@@ -4145,6 +4649,7 @@ private:
         case RendererMode::Legacy: return L"Renderer: Legacy (Direct3D 12)";
         case RendererMode::Shader: return L"Renderer: Shader (Direct3D 12)";
         case RendererMode::Direct2D: return L"Renderer: Direct2D";
+        case RendererMode::Vulkan: return L"Renderer: Vulkan (Vulkan API)";
         }
         return L"Renderer: Unknown";
     }
@@ -4154,6 +4659,42 @@ private:
         if (HWND rendererLabel = Control(kRendererLabelId))
         {
             SetWindowTextW(rendererLabel, RendererDisplayName(rendererMode_));
+        }
+        if (rendererMode_ == RendererMode::Vulkan)
+        {
+            if (HWND gpuLabel = Control(kVsyncLabelId))
+            {
+                if (!vulkanInitialized_)
+                {
+                    SetWindowTextW(gpuLabel, L"GPU: Vulkan adapter selection");
+                }
+                else
+                {
+                    const std::string& deviceName =
+                        vulkanRenderer_.DeviceName();
+                    const int characterCount = MultiByteToWideChar(
+                        CP_UTF8, MB_ERR_INVALID_CHARS, deviceName.c_str(),
+                        -1, nullptr, 0);
+                    if (characterCount <= 0)
+                    {
+                        throw std::runtime_error(
+                            "MultiByteToWideChar failed for Vulkan adapter name");
+                    }
+                    std::wstring wideDeviceName(
+                        static_cast<std::size_t>(characterCount), L'\0');
+                    if (MultiByteToWideChar(
+                            CP_UTF8, MB_ERR_INVALID_CHARS,
+                            deviceName.c_str(), -1, wideDeviceName.data(),
+                            characterCount) != characterCount)
+                    {
+                        throw std::runtime_error(
+                            "MultiByteToWideChar returned an incomplete Vulkan adapter name");
+                    }
+                    wideDeviceName.pop_back();
+                    SetWindowTextW(
+                        gpuLabel, (L"GPU: " + wideDeviceName).c_str());
+                }
+            }
         }
     }
 
@@ -4514,6 +5055,81 @@ private:
         {
             canvasDirty_ = true;
         }
+        else if (interactiveGeometryEnabled_ &&
+                 rendererMode_ == RendererMode::Vulkan)
+        {
+            canvasDirty_ = true;
+            if (circleThroughputBenchmarkActive_)
+            {
+                pendingGeneratedShapesForPresent_ += shapeCount;
+            }
+            LARGE_INTEGER geometryStart{};
+            LARGE_INTEGER uploadStart{};
+            LARGE_INTEGER uploadStop{};
+            const bool measureStages = circleThroughputBenchmarkActive_;
+            if (measureStages &&
+                !QueryPerformanceCounter(&geometryStart))
+            {
+                throw std::runtime_error(
+                    "QueryPerformanceCounter failed before Vulkan geometry preparation");
+            }
+            if (interactiveLayout_)
+            {
+                if (vulkanPersistentCanvas_)
+                {
+                    vulkanVertices_.clear();
+                }
+                for (UINT index = 0; index < shapeCount; ++index)
+                {
+                    const DrawingShape& shape =
+                        drawingShapes_[firstShapeIndex + index];
+                    AppendVulkanShape(
+                        vulkanVertices_, shape);
+                    if (vulkanPersistentCanvas_ && shape.circle)
+                    {
+                        ++pendingVulkanCanvasCircles_;
+                    }
+                }
+            }
+            else
+            {
+                BuildVulkanScene();
+            }
+            if (measureStages &&
+                !QueryPerformanceCounter(&uploadStart))
+            {
+                throw std::runtime_error(
+                    "QueryPerformanceCounter failed after Vulkan geometry preparation");
+            }
+            if (vulkanInitialized_)
+            {
+                if (vulkanPersistentCanvas_)
+                {
+                    vulkanRenderer_.SetCanvasVertices(vulkanVertices_);
+                }
+                else
+                {
+                    vulkanRenderer_.SetVertices(vulkanVertices_);
+                }
+            }
+            if (measureStages &&
+                !QueryPerformanceCounter(&uploadStop))
+            {
+                throw std::runtime_error(
+                    "QueryPerformanceCounter failed after Vulkan vertex staging");
+            }
+            if (measureStages)
+            {
+                AddCircleThroughputElapsed(
+                    circleThroughputMetrics_.rendererGeometryPreparationMilliseconds,
+                    static_cast<UINT64>(
+                        uploadStart.QuadPart - geometryStart.QuadPart));
+                AddCircleThroughputElapsed(
+                    circleThroughputMetrics_.rendererGeometryUploadMilliseconds,
+                    static_cast<UINT64>(
+                        uploadStop.QuadPart - uploadStart.QuadPart));
+            }
+        }
         else if (interactiveGeometryEnabled_)
         {
             canvasDirty_ = true;
@@ -4754,6 +5370,55 @@ private:
 
     void RebuildInteractiveGeometry()
     {
+        if (rendererMode_ == RendererMode::Vulkan)
+        {
+            if (!interactiveLayout_ || requestedCircleCount_ != 0 ||
+                !vulkanInitialized_)
+            {
+                return;
+            }
+            if (vulkanPersistentCanvas_)
+            {
+                if (!vulkanRenderer_.CanvasAvailable())
+                {
+                    canvasRenderedShapeCount_ = 0;
+                    canvasDirty_ = true;
+                    canvasNeedsClear_ = true;
+                    return;
+                }
+                constexpr std::size_t rebuildBatchBytes = 1024U * 1024U;
+                std::vector<VulkanVertex> batch;
+                vulkanRenderer_.BeginCanvasRebuild();
+                pendingVulkanCanvasCircles_ = 0;
+                bool clearCanvas = true;
+                for (const DrawingShape& shape : drawingShapes_)
+                {
+                    AppendVulkanShape(batch, shape);
+                    if (batch.size() * sizeof(VulkanVertex) >=
+                        rebuildBatchBytes)
+                    {
+                        vulkanRenderer_.RebuildCanvasBatch(batch, clearCanvas);
+                        clearCanvas = false;
+                        batch.clear();
+                    }
+                }
+                if (!batch.empty() || clearCanvas)
+                {
+                    vulkanRenderer_.RebuildCanvasBatch(batch, clearCanvas);
+                }
+                vulkanRenderer_.FinishCanvasRebuild();
+                canvasRenderedShapeCount_ = drawingShapes_.size();
+                canvasDirty_ = true;
+                canvasNeedsClear_ = false;
+                return;
+            }
+            BuildVulkanScene();
+            vulkanRenderer_.SetVertices(vulkanVertices_);
+            canvasRenderedShapeCount_ = 0;
+            canvasDirty_ = true;
+            canvasNeedsClear_ = true;
+            return;
+        }
         if (!interactiveLayout_ || requestedCircleCount_ != 0 || !device_ ||
             !interactiveGeometryEnabled_)
         {
@@ -6258,6 +6923,158 @@ float4 PSMain(PSInput input) : SV_TARGET
         }
     }
 
+    void AppendVulkanVertex(
+        std::vector<VulkanVertex>& vertices,
+        float x,
+        float y,
+        float red,
+        float green,
+        float blue)
+    {
+        const float canvasWidth =
+            static_cast<float>(std::max(1U, canvasWidth_));
+        const float canvasHeight =
+            static_cast<float>(std::max(1U, height_));
+        vertices.push_back({
+            2.0f * x / canvasWidth - 1.0f,
+            2.0f * y / canvasHeight - 1.0f,
+            red, green, blue, 1.0f});
+    }
+
+    void AppendVulkanRing(
+        std::vector<VulkanVertex>& vertices,
+        float centerX,
+        float centerY,
+        float radius,
+        float thickness,
+        float red,
+        float green,
+        float blue,
+        UINT segments)
+    {
+        if (segments == 0)
+        {
+            throw std::runtime_error(
+                "Vulkan circle geometry requires at least one segment");
+        }
+        constexpr float twoPi = 6.28318530717958647692f;
+        const float innerRadius = std::max(0.0f, radius - thickness);
+        for (UINT segment = 0; segment < segments; ++segment)
+        {
+            const float angle0 = twoPi * static_cast<float>(segment) /
+                static_cast<float>(segments);
+            const float angle1 = twoPi * static_cast<float>(segment + 1U) /
+                static_cast<float>(segments);
+            const float cosine0 = std::cos(angle0);
+            const float sine0 = std::sin(angle0);
+            const float cosine1 = std::cos(angle1);
+            const float sine1 = std::sin(angle1);
+            const float outerX0 = centerX + cosine0 * radius;
+            const float outerY0 = centerY + sine0 * radius;
+            const float innerX0 = centerX + cosine0 * innerRadius;
+            const float innerY0 = centerY + sine0 * innerRadius;
+            const float outerX1 = centerX + cosine1 * radius;
+            const float outerY1 = centerY + sine1 * radius;
+            const float innerX1 = centerX + cosine1 * innerRadius;
+            const float innerY1 = centerY + sine1 * innerRadius;
+            AppendVulkanVertex(vertices, outerX0, outerY0, red, green, blue);
+            AppendVulkanVertex(vertices, outerX1, outerY1, red, green, blue);
+            AppendVulkanVertex(vertices, innerX1, innerY1, red, green, blue);
+            AppendVulkanVertex(vertices, outerX0, outerY0, red, green, blue);
+            AppendVulkanVertex(vertices, innerX1, innerY1, red, green, blue);
+            AppendVulkanVertex(vertices, innerX0, innerY0, red, green, blue);
+        }
+    }
+
+    void AppendVulkanShape(
+        std::vector<VulkanVertex>& vertices,
+        const DrawingShape& shape)
+    {
+        const float red =
+            static_cast<float>(GetRValue(shape.color)) / 255.0f;
+        const float green =
+            static_cast<float>(GetGValue(shape.color)) / 255.0f;
+        const float blue =
+            static_cast<float>(GetBValue(shape.color)) / 255.0f;
+        if (shape.circle)
+        {
+            const float centerX =
+                (static_cast<float>(shape.x1) +
+                 static_cast<float>(shape.x2)) * 0.5f;
+            const float centerY =
+                (static_cast<float>(shape.y1) +
+                 static_cast<float>(shape.y2)) * 0.5f;
+            const float radius = std::max(
+                1.0f, static_cast<float>(shape.x2 - shape.x1) * 0.5f);
+            const UINT segments = std::clamp(
+                static_cast<UINT>(
+                    6.28318530717958647692f * radius / 3.0f),
+                kMinimumSegments,
+                kMaximumSegments);
+            AppendVulkanRing(
+                vertices,
+                centerX, centerY, radius,
+                static_cast<float>(shape.thickness),
+                red, green, blue, segments);
+            return;
+        }
+
+        const float dx = static_cast<float>(shape.x2 - shape.x1);
+        const float dy = static_cast<float>(shape.y2 - shape.y1);
+        const float length = std::max(1.0f, std::sqrt(dx * dx + dy * dy));
+        const float halfWidth = static_cast<float>(shape.thickness) * 0.5f;
+        const float offsetX = -dy * halfWidth / length;
+        const float offsetY = dx * halfWidth / length;
+        const float x1 = static_cast<float>(shape.x1);
+        const float y1 = static_cast<float>(shape.y1);
+        const float x2 = static_cast<float>(shape.x2);
+        const float y2 = static_cast<float>(shape.y2);
+        AppendVulkanVertex(vertices, x1 + offsetX, y1 + offsetY, red, green, blue);
+        AppendVulkanVertex(vertices, x2 + offsetX, y2 + offsetY, red, green, blue);
+        AppendVulkanVertex(vertices, x2 - offsetX, y2 - offsetY, red, green, blue);
+        AppendVulkanVertex(vertices, x1 + offsetX, y1 + offsetY, red, green, blue);
+        AppendVulkanVertex(vertices, x2 - offsetX, y2 - offsetY, red, green, blue);
+        AppendVulkanVertex(vertices, x1 - offsetX, y1 - offsetY, red, green, blue);
+    }
+
+    void BuildVulkanScene()
+    {
+        vulkanVertices_.clear();
+        if (!interactiveLayout_ || requestedCircleCount_ != 0)
+        {
+            for (const CircleParameters& circle : circleParameters_)
+            {
+                AppendVulkanRing(
+                    vulkanVertices_,
+                    circle.normalizedCenterX *
+                        static_cast<float>(std::max(1U, canvasWidth_)),
+                    circle.normalizedCenterY *
+                        static_cast<float>(std::max(1U, height_)),
+                    circle.outerRadius,
+                    circle.thickness,
+                    circle.red,
+                    circle.green,
+                    circle.blue,
+                    circle.segments);
+            }
+        }
+        else
+        {
+            for (const DrawingShape& shape : drawingShapes_)
+            {
+                AppendVulkanShape(vulkanVertices_, shape);
+            }
+        }
+        if (vulkanVertices_.size() >
+            static_cast<std::size_t>(
+                std::numeric_limits<std::uint32_t>::max() /
+                sizeof(VulkanVertex)))
+        {
+            throw std::overflow_error(
+                "Vulkan scene exceeds the supported vertex buffer size");
+        }
+    }
+
     void GenerateCircleGeometry()
     {
         vertices_.clear();
@@ -6951,6 +7768,40 @@ float4 PSMain(PSInput input) : SV_TARGET
         resizePending_ = false;
         if (pendingWidth_ == width_ && pendingHeight_ == height_)
         {
+            if (rendererMode_ == RendererMode::Vulkan &&
+                vulkanInitialized_)
+            {
+                vulkanRenderer_.Resize(width_, height_);
+                if (vulkanPersistentCanvas_ &&
+                    vulkanRenderer_.CanvasRebuildRequired())
+                {
+                    RebuildInteractiveGeometry();
+                }
+            }
+            return;
+        }
+
+        if (rendererMode_ == RendererMode::Vulkan)
+        {
+            if (pendingWidth_ == 0 || pendingHeight_ == 0)
+            {
+                return;
+            }
+            width_ = pendingWidth_;
+            height_ = pendingHeight_;
+            UpdateCanvasWidth();
+            vulkanRenderer_.Resize(width_, height_);
+            if (!vulkanPersistentCanvas_)
+            {
+                BuildVulkanScene();
+                vulkanRenderer_.SetVertices(vulkanVertices_);
+            }
+            canvasDirty_ = true;
+            if (!vulkanPersistentCanvas_)
+            {
+                canvasRenderedShapeCount_ = 0;
+                canvasNeedsClear_ = true;
+            }
             return;
         }
 
@@ -7169,6 +8020,10 @@ float4 PSMain(PSInput input) : SV_TARGET
     D3D12_VERTEX_BUFFER_VIEW vertexBufferView_{};
     D3D12_INDEX_BUFFER_VIEW indexBufferView_{};
     std::vector<CircleParameters> circleParameters_;
+    std::vector<VulkanVertex> vulkanVertices_;
+    VulkanRenderer vulkanRenderer_;
+    bool vulkanPersistentCanvas_ = false;
+    UINT64 pendingVulkanCanvasCircles_ = 0;
     std::vector<Vertex> vertices_;
     std::vector<std::uint16_t> indices_;
     std::vector<CircleDraw> circleDraws_;
@@ -7223,6 +8078,7 @@ float4 PSMain(PSInput input) : SV_TARGET
     bool diagnosticsEnabled_ = false;
     bool pipelineComparisonEnabled_ = false;
     RendererMode rendererMode_ = RendererMode::Legacy;
+    bool vulkanInitialized_ = false;
     GpuSelection gpuSelection_ = GpuSelection::Auto;
     bool pipelineComparisonActive_ = false;
     bool interactiveGeometryEnabled_ = true;
@@ -7410,15 +8266,16 @@ CommandLineOptions ParseCommandLine()
         {
             const std::wstring value = nextValue();
             if (value != L"legacy" && value != L"shader" &&
-                value != L"direct2d")
+                value != L"direct2d" && value != L"vulkan")
             {
                 throw std::runtime_error(
-                    "--renderer accepts only legacy, shader, or direct2d.");
+                    "--renderer accepts only legacy, shader, direct2d, or vulkan.");
             }
             options.rendererMode =
                 value == L"shader" ? RendererMode::Shader :
                 value == L"direct2d" ? RendererMode::Direct2D :
-                                       RendererMode::Legacy;
+                value == L"vulkan" ? RendererMode::Vulkan :
+                                     RendererMode::Legacy;
             continue;
         }
         if (argument == L"--gpu")
@@ -7565,6 +8422,16 @@ CommandLineOptions ParseCommandLine()
             "--circle-throughput-benchmark; "
             "--benchmark, --gpu-benchmark, --pipeline-compare, and "
             "--visual-capture use D3D12-specific infrastructure.");
+    }
+    if (options.rendererMode == RendererMode::Vulkan &&
+        (options.benchmark || options.gpuBenchmark ||
+         options.pipelineComparison || options.visualCapture))
+    {
+        throw std::runtime_error(
+            "Vulkan supports interactive rendering, --render-benchmark, and "
+            "--circle-throughput-benchmark; --benchmark, --gpu-benchmark, "
+            "--pipeline-compare, and --visual-capture use D3D12-specific "
+            "infrastructure or timing.");
     }
     return options;
 }
@@ -7750,15 +8617,17 @@ int WINAPI wWinMain(
 {
     D3D12App app;
     HWND window = nullptr;
+    RendererMode errorRendererMode = RendererMode::Legacy;
 
     try
     {
         const CommandLineOptions options = ParseCommandLine();
+        errorRendererMode = options.rendererMode;
         if (options.showHelp)
         {
             MessageBoxW(
                 nullptr,
-                L"Usage: main.exe [--renderer legacy|shader|direct2d] [--gpu auto|igpu|dgpu] [--circles 1|128|1000|5000|10000] [--benchmark|--render-benchmark|--circle-throughput-benchmark|--gpu-benchmark|--visual-capture] [--circle-batch-size 1..512] [--output-file path.json] [--diagnostics] [--timer-mode wm|qpc] [--timer-compare] [--pipeline-compare]\n"
+                L"Usage: main.exe [--renderer legacy|shader|direct2d|vulkan] [--gpu auto|igpu|dgpu] [--circles 1|128|1000|5000|10000] [--benchmark|--render-benchmark|--circle-throughput-benchmark|--gpu-benchmark|--visual-capture] [--circle-batch-size 1..512] [--output-file path.json] [--diagnostics] [--timer-mode wm|qpc] [--timer-compare] [--pipeline-compare]\n"
                 L"Interactive mode starts with an empty canvas.\n"
                 L"--benchmark defaults to one circle if --circles is omitted.\n"
                 L"The 128-circle scene is generated with a fixed seed.\n"
@@ -7773,7 +8642,11 @@ int WINAPI wWinMain(
                 L"--gpu-benchmark requires --circles N, prepares a fixed scene, warms up for 3 s, and measures GPU draw timestamps for 10 s.\n"
                 L"--visual-capture writes a deterministic diagnostic BMP.\n"
                 L"--renderer shader draws circles with an instanced procedural HLSL pipeline; legacy remains the default.\n"
-                L"--gpu auto preserves the default adapter selection; igpu selects AMD Radeon 890M; dgpu selects NVIDIA GeForce RTX 4060 Laptop GPU.\n"
+                L"--renderer vulkan uses a Vulkan swap chain; GLSL shaders are embedded in the executable as Windows RCDATA resources, so external .spv files are not required at runtime.\n"
+                L"Vulkan --gpu auto prefers discrete, then integrated adapters; igpu and dgpu require a Vulkan-capable adapter of that exact type.\n"
+                L"For the expected system, igpu selects AMD Radeon 890M and dgpu selects NVIDIA GeForce RTX 4060 Laptop GPU when exposed by Vulkan.\n"
+                L"Vulkan --render-benchmark reports presented-frame CPU elapsed time; GPU execution time is unavailable.\n"
+                L"--gpu auto preserves the default D3D12 adapter selection; igpu selects AMD Radeon 890M; dgpu selects NVIDIA GeForce RTX 4060 Laptop GPU.\n"
                 L"Direct2D HWND targets do not expose or guarantee --gpu adapter selection; diagnostics report the adapter as unknown.\n"
                 L"--diagnostics reports Present, frame-wait, and object-add timings.\n"
                 L"For Legacy, --diagnostics also reports CPU vector size/capacity, current and retired D3D12 geometry-buffer capacities, and process PrivateUsage once per second under [diag][legacy-memory].\n"
@@ -8014,12 +8887,16 @@ int WINAPI wWinMain(
     }
     catch (const std::exception& error)
     {
-        std::cerr << "Native D3D12 benchmark failed: "
+        const char* errorTitle =
+            errorRendererMode == RendererMode::Vulkan
+                ? "Native Vulkan benchmark failed"
+                : "Native D3D12 benchmark failed";
+        std::cerr << errorTitle << ": "
                   << error.what() << std::endl;
         MessageBoxA(
             window,
             error.what(),
-            "Native D3D12 benchmark failed",
+            errorTitle,
             MB_OK | MB_ICONERROR);
         try
         {
@@ -8027,7 +8904,9 @@ int WINAPI wWinMain(
         }
         catch (const std::exception& cleanupError)
         {
-            std::cerr << "D3D12 cleanup failed: "
+            std::cerr << (errorRendererMode == RendererMode::Vulkan
+                              ? "Vulkan cleanup failed: "
+                              : "D3D12 cleanup failed: ")
                       << cleanupError.what() << std::endl;
         }
         if (window != nullptr && IsWindow(window))
